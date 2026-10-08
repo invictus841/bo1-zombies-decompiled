@@ -1,0 +1,19 @@
+{
+  "name": "bo1-zombies-browser-coop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Two-player browser co-op relay and client adapter for BO1 Zombies",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check shared/protocol.js && node --check relay/src/index.js && node --check client/src/coop-client.js && node --check client/src/authoritative-session.js",
+    "test": "node --test test/*.test.js",
+    "dev:relay": "wrangler dev --config relay/wrangler.jsonc",
+    "deploy:relay": "wrangler deploy --config relay/wrangler.jsonc"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
