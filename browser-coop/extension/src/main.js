@@ -355,6 +355,15 @@ function hostTick(coop) {
   if (!coop.peer) coop.lastStateKey = null;
   // Wait for player 2 before starting, unless the host chose to start alone.
   coop.gate = screen === "ready" && !coop.startAlone && !(slot && slot.state === CLIENT_STATE.active);
+  // The start screen holds the whole game on its first frame (intro hold), and a held game answers nobody. Once
+  // player 2 has loaded the map and is about to join, release the hold as the host's own click would; the host stays
+  // behind the start gate until player 2 is in.
+  const guestJoining = ["waiting-host", "freezing", "connect", "challenging", "joining"].includes(coop.peerState?.phase);
+  if (mem && coop.peer && guestJoining && screen === "ready" && !coop.introReleased && mem.int(coop.build.browser.introState) === 1) {
+    coop.introReleased = true;
+    mem.Module._KB_Input?.(7, 1, 0);
+    coop.note("released the start hold so player 2 can join");
+  }
   // A paused server ignores join requests, and alone the host's server pauses on the start screen (intro hold) and
   // in the pause menu. While player 2 is in the room but not in the game yet, keep it running. (With two players
   // in the game the server never pauses anyway.)
@@ -372,6 +381,11 @@ function hostTick(coop) {
 }
 
 function guestTick(coop) {
+  if (coop.peer && coop.phase !== coop.sentPhase) {
+    coop.sentPhase = coop.phase;
+    send(coop, { t: "state", phase: coop.phase, v: VERSION });
+  }
+  if (!coop.peer) coop.sentPhase = null;
   const mem = coop.mem;
   const screen = window.five?.screen;
   const conn = mem?.connectionState();
