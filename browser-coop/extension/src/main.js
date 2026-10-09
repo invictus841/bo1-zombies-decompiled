@@ -91,6 +91,7 @@ function start() {
       navigator.clipboard?.writeText(inviteLink(coop)).then(() => { coop.copiedAt = Date.now(); }, () => { coop.notice = inviteLink(coop); });
     },
     leave: () => { coop.pump?.postMessage({ type: "close" }); go(location.pathname); },
+    startNow: () => { coop.startAlone = true; },
     controller: () => {
       coop.controller = !coop.controller;
       saveSetting("bo1z-coop-controller", coop.controller ? "1" : "0");
@@ -116,6 +117,7 @@ function start() {
   if (coop.mode) {
     coop.phase = coop.mode === "host" ? "hosting" : "joining-room";
     coop.pump = startPump(coop);
+    if (coop.mode === "host") installStartWait(coop, panel);
   }
   setInterval(() => tick(coop), 50);
 }
@@ -197,6 +199,20 @@ function installCallMainHook(coop) {
       });
     },
   });
+}
+
+// In BO1 zombies a player who joins after the round has started watches until the next round. So while player 2
+// is in the room but not in the game yet, the host's "click to start" waits (the card offers "Start now").
+// Only the host waits: a guest that cannot click in sends no moves and times out.
+function installStartWait(coop, panel) {
+  const block = (event) => {
+    if (!coop.gate || event.composedPath?.().includes(panel.host)) return;
+    event.stopImmediatePropagation();
+    event.preventDefault();
+  };
+  for (const type of ["keydown", "keyup", "mousedown", "mouseup", "click", "pointerdown", "pointerup"]) {
+    window.addEventListener(type, block, true);
+  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -361,6 +377,7 @@ function hostTick(coop) {
     send(coop, state);
   }
   if (!coop.peer) coop.lastStateKey = null;
+  coop.gate = screen === "ready" && coop.peer && !coop.startAlone && !(slot && slot.state === CLIENT_STATE.active);
   // The start screen holds the whole game on its first frame (intro hold), and a held game answers nobody. Once
   // player 2 has loaded the map and is about to join, release the hold as the host's own click would.
   const guestJoining = ["waiting-host", "freezing", "connect", "challenging", "joining"].includes(coop.peerState?.phase);
@@ -434,6 +451,7 @@ function guestTick(coop) {
       }
       // "LOCALHOST", not "localhost": the exact lowercase name would also shut our local server down.
       if (mem.command("connect LOCALHOST")) {
+        coop.joinedLate = coop.peerState?.screen === "playing";
         coop.connectAt = Date.now();
         coop.phase = "challenging";
         coop.note("connect sent");
@@ -508,8 +526,11 @@ function view(coop) {
     blocks.push({ kind: "lines", lines: [["Relay", relay], ["Player 2", p2], ["Ping", rtt]] });
     if (!coop.mem && screen !== "loading" && screen !== "download") {
       blocks.push({ kind: "text", cls: "muted small", text: "Pick a map. Player 2 follows you to it." });
+    } else if (coop.gate) {
+      blocks.push({ kind: "text", text: "Player 2 is on the way. Your start waits for them, so they spawn with you." });
+      blocks.push({ kind: "buttons", buttons: [{ act: "startNow", label: "Start now" }] });
     } else if (!(slot?.state === CLIENT_STATE.active)) {
-      blocks.push({ kind: "text", cls: "muted small", text: "Player 2 can join any time, before or after you click in." });
+      blocks.push({ kind: "text", cls: "muted small", text: "If you start before player 2 is in, they watch until the next round (the BO1 rule for latecomers)." });
     }
     pill = `Co-op · P2 ${slot?.state === CLIENT_STATE.active && coop.peer ? "in" : "not in"} · ${rtt}`;
   } else {
@@ -533,6 +554,9 @@ function view(coop) {
       blocks.push({ kind: "text", text: "Press any key on the page to load the map." });
     }
     blocks.push({ kind: "text", text: steps[coop.phase] ?? "Joining…" });
+    if (coop.joinedLate && ["joining", "connected"].includes(coop.phase)) {
+      blocks.push({ kind: "text", cls: "muted small", text: "The host had already started, so you watch until the next round, then spawn (the BO1 rule for latecomers)." });
+    }
     blocks.push({ kind: "lines", lines: [["Room", coop.room], ["Relay", relay], ["Host", coop.peer ? "here" : "not here"], ["Ping", rtt]] });
     if (coop.phase === "connected" && screen === "ready") blocks.push({ kind: "text", cls: "muted small", text: "Click the game to play." });
     pill = `Co-op · ${coop.phase === "connected" ? "with host" : steps[coop.phase] ?? ""} · ${rtt}`;
