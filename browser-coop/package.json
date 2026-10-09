@@ -1,19 +1,22 @@
 {
   "name": "bo1-zombies-browser-coop",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Two-player browser co-op relay and client adapter for BO1 Zombies",
+  "description": "Two-player co-op for the browser BO1 Zombies at vel.gg: Chrome extension + Cloudflare relay",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
-    "check": "node --check shared/protocol.js && node --check relay/src/index.js && node --check client/src/coop-client.js && node --check client/src/authoritative-session.js",
+    "build": "node extension/build.mjs",
+    "check": "node --check shared/protocol.js && node --check relay/src/index.js && node extension/build.mjs && node --check extension/dist/coop-main.js",
     "test": "node --test test/*.test.js",
     "dev:relay": "wrangler dev --config relay/wrangler.jsonc",
     "deploy:relay": "wrangler deploy --config relay/wrangler.jsonc"
   },
   "devDependencies": {
+    "esbuild": "^0.28.2",
+    "puppeteer-core": "^24.43.1",
     "wrangler": "^4.0.0"
   }
 }

@@ -1,15 +1,24 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  MAX_BINARY_BYTES,
+  MAX_TEXT_BYTES,
   PROTOCOL_VERSION,
-  ROOM_CAPACITY,
-  parseWireMessage,
-  serverMessage,
-  validateClientMessage,
+  ROLES,
+  ROOM_ID_PATTERN,
+  isPeerMessage,
+  parseControl,
 } from "../../shared/protocol.js";
 
-const ROOM_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
-const HOST_DISCONNECTED_CLOSE_CODE = 4002;
-const INVALID_CLIENT_CLOSE_CODE = 4003;
+const REPLACED_CLOSE_CODE = 4001;
+const PROTOCOL_CLOSE_CODE = 4003;
+const TOO_BIG_CLOSE_CODE = 1009;
+
+// Token buckets per socket. Excess binary frames are dropped silently, like UDP
+// packets; the engine's netchan already copes with loss.
+const BINARY_RATE = 400;
+const BINARY_BURST = 800;
+const TEXT_RATE = 20;
+const TEXT_BURST = 40;
 
 function json(body, status = 200, headers = {}) {
   return new Response(JSON.stringify(body), {
@@ -26,21 +35,15 @@ function allowedOrigins(env) {
 }
 
 function isOriginAllowed(request, env) {
+  // Browsers always send Origin on a WebSocket upgrade; tools and tests do not.
   const origin = request.headers.get("Origin");
   return !origin || allowedOrigins(env).includes(origin);
 }
 
 function corsHeaders(request, env) {
   const origin = request.headers.get("Origin");
-  if (!origin || !isOriginAllowed(request, env)) {
-    return {};
-  }
-
-  return {
-    "access-control-allow-origin": origin,
-    vary: "Origin",
-    "access-control-allow-methods": "GET, OPTIONS",
-  };
+  if (!origin || !isOriginAllowed(request, env)) return {};
+  return { "access-control-allow-origin": origin, vary: "Origin", "access-control-allow-methods": "GET, OPTIONS" };
 }
 
 function isWebSocketUpgrade(request) {
@@ -49,10 +52,7 @@ function isWebSocketUpgrade(request) {
 
 function roomIdFromPath(pathname) {
   const parts = pathname.split("/").filter(Boolean);
-  if (parts.length !== 3 || parts[0] !== "v1" || parts[1] !== "rooms") {
-    return null;
-  }
-
+  if (parts.length !== 3 || parts[0] !== "v1" || parts[1] !== "rooms") return null;
   try {
     const roomId = decodeURIComponent(parts[2]);
     return ROOM_ID_PATTERN.test(roomId) ? roomId : null;
@@ -61,17 +61,11 @@ function roomIdFromPath(pathname) {
   }
 }
 
-/**
- * Public Worker. It validates the public upgrade request then routes every room
- * to exactly one Durable Object instance. Game messages never live here.
- */
+/** Public Worker: validates the upgrade and routes each room to one Durable Object. */
 export default {
   async fetch(request, env) {
     const headers = corsHeaders(request, env);
-
-    if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers });
 
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/health") {
@@ -79,258 +73,166 @@ export default {
     }
 
     const roomId = roomIdFromPath(url.pathname);
-    if (!roomId) {
-      return json({ error: "not_found" }, 404, headers);
-    }
+    if (!roomId) return json({ error: "not_found" }, 404, headers);
+    if (!isOriginAllowed(request, env)) return json({ error: "origin_not_allowed" }, 403, headers);
+    if (!isWebSocketUpgrade(request)) return json({ error: "websocket_upgrade_required" }, 426, headers);
 
-    if (!isOriginAllowed(request, env)) {
-      return json({ error: "origin_not_allowed" }, 403, headers);
-    }
-
-    if (!isWebSocketUpgrade(request)) {
-      return json({ error: "websocket_upgrade_required" }, 426, headers);
-    }
+    const role = url.searchParams.get("role");
+    if (!ROLES.includes(role)) return json({ error: "invalid_role" }, 400, headers);
+    const version = Number(url.searchParams.get("v") ?? PROTOCOL_VERSION);
+    if (version !== PROTOCOL_VERSION) return json({ error: "protocol_mismatch", protocol: PROTOCOL_VERSION }, 400, headers);
 
     const forwardedHeaders = new Headers(request.headers);
-    // This header is set by the public Worker, never accepted from the client.
+    // Set by this Worker only; never trusted from the client.
     forwardedHeaders.set("x-bo1-room-id", roomId);
-    const roomRequest = new Request(request, { headers: forwardedHeaders });
+    forwardedHeaders.set("x-bo1-role", role);
     const id = env.ROOM_RELAY.idFromName(`bo1-coop:${roomId}`);
-    return env.ROOM_RELAY.get(id).fetch(roomRequest);
+    return env.ROOM_RELAY.get(id).fetch(new Request(request, { headers: forwardedHeaders }));
   },
 };
 
 /**
- * A hibernatable, room-scoped WebSocket relay. Player 0 is the host and is the
- * only client allowed to send snapshots or game events. Player 1 can only send
- * validated input frames. Attachments retain roles and ready state if the
- * Durable Object hibernates between packets.
+ * A room of two: one host, one guest. The relay forwards binary packet batches
+ * and peer control messages between them and never inspects game data. A new
+ * connection for a role replaces the old one (a page reload or navigation).
+ * Uses the hibernation API; roles live in socket tags and attachments.
  */
 export class RoomRelay extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    // Rate-limit state is per instance; it simply resets after hibernation.
+    this.buckets = new Map();
+  }
+
   async fetch(request) {
     const roomId = request.headers.get("x-bo1-room-id");
-    if (!roomId || !ROOM_ID_PATTERN.test(roomId) || !isWebSocketUpgrade(request)) {
+    const role = request.headers.get("x-bo1-role");
+    if (!roomId || !ROOM_ID_PATTERN.test(roomId) || !ROLES.includes(role) || !isWebSocketUpgrade(request)) {
       return json({ error: "invalid_room_request" }, 400);
     }
 
-    const members = this.members();
-    if (members.length >= ROOM_CAPACITY) {
-      return json({ error: "room_full" }, 409);
+    for (const old of this.socketsFor(role)) {
+      this.send(old, { t: "error", code: "replaced" });
+      this.safeClose(old, REPLACED_CLOSE_CODE, "Replaced by a new connection");
     }
 
-    const playerId = this.nextPlayerId(members);
-    if (playerId === null) {
-      return json({ error: "room_full" }, 409);
-    }
+    const [client, server] = Object.values(new WebSocketPair());
+    this.ctx.acceptWebSocket(server, [role]);
+    server.serializeAttachment({ roomId, role, joinedAt: Date.now() });
 
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-    const connection = {
-      roomId,
-      playerId,
-      ready: false,
-      joinedAt: Date.now(),
-    };
-
-    this.ctx.acceptWebSocket(server, [`player:${playerId}`]);
-    server.serializeAttachment(connection);
-
-    this.send(server, serverMessage("joined", {
-      roomId,
-      playerId,
-      capacity: ROOM_CAPACITY,
-    }));
-    this.broadcastRoomState();
+    const peer = this.peerOf(role);
+    this.send(server, { t: "welcome", v: PROTOCOL_VERSION, role, peer: peer !== null });
+    if (peer) this.send(peer, { t: "peer", present: true });
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
   webSocketMessage(socket, payload) {
-    const connection = this.connectionFor(socket);
-    if (!connection) {
-      socket.close(INVALID_CLIENT_CLOSE_CODE, "Unknown room connection");
+    const role = this.roleOf(socket);
+    if (!role) {
+      this.safeClose(socket, PROTOCOL_CLOSE_CODE, "Unknown connection");
       return;
     }
 
-    const parsed = parseWireMessage(payload);
-    if (!parsed.ok) {
-      this.protocolError(socket, parsed.error);
+    if (typeof payload === "string") {
+      if (payload.length > MAX_TEXT_BYTES) {
+        this.safeClose(socket, TOO_BIG_CLOSE_CODE, "Text frame too large");
+        return;
+      }
+      if (!this.take(socket, "text", TEXT_RATE, TEXT_BURST)) {
+        this.send(socket, { t: "error", code: "rate_limited" });
+        return;
+      }
+      const message = parseControl(payload);
+      if (!isPeerMessage(message)) {
+        this.send(socket, { t: "error", code: "bad_message" });
+        return;
+      }
+      const peer = this.peerOf(role);
+      if (peer) this.sendRaw(peer, payload);
       return;
     }
 
-    const validated = validateClientMessage(parsed.value);
-    if (!validated.ok) {
-      this.protocolError(socket, validated.error);
+    if (payload.byteLength > MAX_BINARY_BYTES) {
+      this.safeClose(socket, TOO_BIG_CLOSE_CODE, "Binary frame too large");
       return;
     }
-
-    const message = validated.value;
-    switch (message.type) {
-      case "hello":
-        this.send(socket, serverMessage("room-state", { players: this.publicMembers() }));
-        return;
-      case "ready":
-        socket.serializeAttachment({ ...connection, ready: message.ready });
-        this.broadcastRoomState();
-        this.startMatchIfReady();
-        return;
-      case "input":
-        if (connection.playerId !== 1) {
-          this.protocolError(socket, "only_guest_may_send_input");
-          return;
-        }
-        if (!this.isMatchReady()) {
-          this.protocolError(socket, "match_not_ready");
-          return;
-        }
-        this.sendToPlayer(0, serverMessage("input", {
-          playerId: 1,
-          seq: message.seq,
-          tick: message.tick,
-          input: message.input,
-        }));
-        return;
-      case "snapshot":
-        if (connection.playerId !== 0) {
-          this.protocolError(socket, "only_host_may_send_snapshots");
-          return;
-        }
-        if (!this.isMatchReady()) {
-          this.protocolError(socket, "match_not_ready");
-          return;
-        }
-        this.sendToPlayer(1, serverMessage("snapshot", {
-          playerId: 0,
-          seq: message.seq,
-          tick: message.tick,
-          state: message.state,
-        }));
-        return;
-      case "event":
-        if (connection.playerId !== 0) {
-          this.protocolError(socket, "only_host_may_send_events");
-          return;
-        }
-        if (!this.isMatchReady()) {
-          this.protocolError(socket, "match_not_ready");
-          return;
-        }
-        this.sendToPlayer(1, serverMessage("event", {
-          playerId: 0,
-          seq: message.seq,
-          tick: message.tick,
-          event: message.event,
-        }));
-        return;
-      default:
-        this.protocolError(socket, "unsupported_message_type");
-    }
+    if (!this.take(socket, "binary", BINARY_RATE, BINARY_BURST)) return;
+    const peer = this.peerOf(role);
+    if (peer) this.sendRaw(peer, payload);
   }
 
-  webSocketClose(socket) {
-    const connection = this.connectionFor(socket);
-    if (!connection) {
-      return;
-    }
-
-    if (connection.playerId === 0) {
-      // A replacement host would not have the authoritative simulation state.
-      // End the paired session instead of silently promoting or swapping roles.
-      for (const member of this.members(socket)) {
-        this.send(member.socket, serverMessage("match-ended", { reason: "host_disconnected" }));
-        member.socket.close(HOST_DISCONNECTED_CLOSE_CODE, "Host disconnected");
-      }
-      return;
-    }
-
-    this.sendToPlayer(0, serverMessage("peer-left", { playerId: 1 }));
-    this.broadcastRoomState();
+  webSocketClose(socket, code, reason) {
+    this.leave(socket);
+    // Complete the close handshake; the runtime does not do it for us.
+    this.safeClose(socket, code === 1005 || code === 1006 ? 1000 : code, reason);
   }
 
   webSocketError(socket) {
-    socket.close(INVALID_CLIENT_CLOSE_CODE, "WebSocket error");
+    this.leave(socket);
+    this.safeClose(socket, PROTOCOL_CLOSE_CODE, "WebSocket error");
   }
 
-  members(exceptSocket) {
-    return this.ctx
-      .getWebSockets()
-      .filter((socket) => socket !== exceptSocket)
-      .map((socket) => ({ socket, connection: this.connectionFor(socket) }))
-      .filter((member) => member.connection !== null);
+  leave(socket) {
+    this.buckets.delete(socket);
+    const role = this.roleOf(socket);
+    if (!role) return;
+    // A replaced socket leaves while its successor is already open: the peer
+    // never noticed a gap, so do not tell it the other player left.
+    if (this.socketsFor(role, socket).length > 0) return;
+    const peer = this.peerOf(role);
+    if (peer) this.send(peer, { t: "peer", present: false });
   }
 
-  connectionFor(socket) {
+  roleOf(socket) {
     const attachment = socket.deserializeAttachment();
-    if (
-      !attachment ||
-      typeof attachment !== "object" ||
-      !ROOM_ID_PATTERN.test(attachment.roomId) ||
-      !Number.isInteger(attachment.playerId) ||
-      attachment.playerId < 0 ||
-      attachment.playerId >= ROOM_CAPACITY ||
-      typeof attachment.ready !== "boolean"
-    ) {
-      return null;
+    return attachment && ROLES.includes(attachment.role) ? attachment.role : null;
+  }
+
+  /** Open sockets holding `role`, excluding `except` (getWebSockets() still lists a closing socket). */
+  socketsFor(role, except) {
+    return this.ctx
+      .getWebSockets(role)
+      .filter((socket) => socket !== except && socket.readyState === 1 /* OPEN */);
+  }
+
+  peerOf(role) {
+    const [peer] = this.socketsFor(role === "host" ? "guest" : "host");
+    return peer ?? null;
+  }
+
+  take(socket, kind, rate, burst) {
+    const now = Date.now();
+    let bucket = this.buckets.get(socket);
+    if (!bucket) {
+      bucket = { binary: { tokens: BINARY_BURST, at: now }, text: { tokens: TEXT_BURST, at: now } };
+      this.buckets.set(socket, bucket);
     }
-
-    return attachment;
-  }
-
-  nextPlayerId(members) {
-    const occupied = new Set(members.map((member) => member.connection.playerId));
-    for (let playerId = 0; playerId < ROOM_CAPACITY; playerId += 1) {
-      if (!occupied.has(playerId)) {
-        return playerId;
-      }
-    }
-    return null;
-  }
-
-  publicMembers() {
-    return this.members()
-      .map(({ connection }) => ({ playerId: connection.playerId, ready: connection.ready }))
-      .sort((left, right) => left.playerId - right.playerId);
-  }
-
-  broadcastRoomState() {
-    const message = serverMessage("room-state", { players: this.publicMembers() });
-    for (const { socket } of this.members()) {
-      this.send(socket, message);
-    }
-  }
-
-  startMatchIfReady() {
-    if (!this.isMatchReady()) {
-      return;
-    }
-
-    for (const { socket } of this.members()) {
-      this.send(socket, serverMessage("match-start", { tick: 0 }));
-    }
-  }
-
-  isMatchReady() {
-    const members = this.members();
-    return members.length === ROOM_CAPACITY && members.every(({ connection }) => connection.ready);
-  }
-
-  sendToPlayer(playerId, message) {
-    const member = this.members().find((entry) => entry.connection.playerId === playerId);
-    if (member) {
-      this.send(member.socket, message);
-    }
-  }
-
-  protocolError(socket, code) {
-    this.send(socket, serverMessage("error", { code }));
+    const state = bucket[kind];
+    state.tokens = Math.min(burst, state.tokens + ((now - state.at) / 1000) * rate);
+    state.at = now;
+    if (state.tokens < 1) return false;
+    state.tokens -= 1;
+    return true;
   }
 
   send(socket, message) {
+    this.sendRaw(socket, JSON.stringify(message));
+  }
+
+  sendRaw(socket, payload) {
     try {
-      socket.send(JSON.stringify(message));
+      socket.send(payload);
     } catch {
-      // A peer can close between getWebSockets() and send(). The close handler
-      // will clean up room state; the relay does not need to retry stale data.
+      // The peer closed between lookup and send; its close handler cleans up.
+    }
+  }
+
+  safeClose(socket, code, reason) {
+    try {
+      socket.close(code, reason);
+    } catch {
+      // Already closed.
     }
   }
 }

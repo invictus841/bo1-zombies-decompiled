@@ -1,224 +1,122 @@
 /**
- * The protocol deliberately carries inputs in one direction and snapshots in
- * the other. The relay assigns player IDs; client-supplied player IDs are never
- * used. Keeping this file dependency-free lets the browser and Worker agree on
- * validation without a build-time package boundary.
+ * Wire protocol shared by the relay (relay/src/index.js) and the browser
+ * extension (extension/src). Version 2 tunnels the engine's own loopback
+ * packets; the relay never looks inside them.
+ *
+ * A room holds one host and one guest. Each opens
+ *   wss://<relay>/v1/rooms/<room>?role=host|guest
+ *
+ * Text frames are small JSON objects with a string `t`:
+ *   relay -> client: welcome { role, peer }, peer { present }, error { code }
+ *   client -> peer:  any other `t` (info, state, ping, pong, bye), forwarded verbatim
+ * Binary frames are packet batches (encodePackets) and are forwarded verbatim.
  */
-export const PROTOCOL_VERSION = 1;
-export const ROOM_CAPACITY = 2;
-export const MAX_WIRE_CHARS = 48_000;
 
-export const NEUTRAL_INPUT = Object.freeze({
-  moveX: 0,
-  moveY: 0,
-  lookX: 0,
-  lookY: 0,
-  actions: 0,
-});
+export const PROTOCOL_VERSION = 2;
+export const ROLES = Object.freeze(["host", "guest"]);
+export const RELAY_MESSAGE_TYPES = Object.freeze(["welcome", "peer", "error"]);
 
-const INPUT_KEYS = ["moveX", "moveY", "lookX", "lookY", "actions"];
-const MAX_SEQUENCE = 0x7fffffff;
-const MAX_TICK = 0x7fffffff;
+export const MAX_TEXT_BYTES = 4096;
+export const MAX_BINARY_BYTES = 65536;
+// One engine loopback slot carries at most 1264 bytes (loopmsg_t data).
+export const MAX_PACKET_BYTES = 1264;
 
-function isRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+export const ROOM_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?$/;
+// Crockford base32 without i, l, o, u: no look-alike characters when read aloud.
+const ROOM_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz";
+export const ROOM_CODE_LENGTH = 16; // 80 bits
+
+export function createRoomCode(random = (bytes) => crypto.getRandomValues(bytes)) {
+  const bytes = random(new Uint8Array(ROOM_CODE_LENGTH));
+  let code = "";
+  for (const byte of bytes) code += ROOM_ALPHABET[byte & 31];
+  return code.match(/.{4}/g).join("-");
 }
 
-function isIntegerInRange(value, minimum, maximum) {
-  return Number.isInteger(value) && value >= minimum && value <= maximum;
-}
-
-function isFiniteInRange(value, minimum, maximum) {
-  return typeof value === "number" && Number.isFinite(value) && value >= minimum && value <= maximum;
-}
-
-function isValidProtocolVersion(value) {
-  return value === PROTOCOL_VERSION;
-}
-
-function isValidInput(input) {
-  if (!isRecord(input) || Object.keys(input).length !== INPUT_KEYS.length) {
-    return false;
+/** Accepts what people paste: any case, spaces, a full invite link. */
+export function normalizeRoomCode(input) {
+  if (typeof input !== "string") return null;
+  let text = input.trim();
+  try {
+    const url = new URL(text);
+    text = url.searchParams.get("room") ?? "";
+  } catch {
+    // Not a URL: a bare code.
   }
-
-  return (
-    isFiniteInRange(input.moveX, -1, 1) &&
-    isFiniteInRange(input.moveY, -1, 1) &&
-    isFiniteInRange(input.lookX, -1, 1) &&
-    isFiniteInRange(input.lookY, -1, 1) &&
-    isIntegerInRange(input.actions, 0, 0xffff)
-  );
+  const compact = text.toLowerCase().replace(/[^0-9a-z]/g, "");
+  if (compact.length !== ROOM_CODE_LENGTH || [...compact].some((c) => !ROOM_ALPHABET.includes(c))) return null;
+  return compact.match(/.{4}/g).join("-");
 }
 
-function isValidEvent(event) {
-  return (
-    isRecord(event) &&
-    typeof event.kind === "string" &&
-    event.kind.length > 0 &&
-    event.kind.length <= 64 &&
-    (!Object.hasOwn(event, "data") || isJsonValue(event.data))
-  );
-}
-
-/** Returns whether a value can be safely re-serialized as JSON. */
-export function isJsonValue(value) {
-  if (value === null || typeof value === "string" || typeof value === "boolean") {
-    return true;
-  }
-
-  if (typeof value === "number") {
-    return Number.isFinite(value);
-  }
-
-  if (Array.isArray(value)) {
-    return value.every(isJsonValue);
-  }
-
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  return Object.entries(value).every(([key, entry]) => key.length <= 128 && isJsonValue(entry));
+export function relaySocketUrl(relayBase, room, role) {
+  const url = new URL(relayBase);
+  url.protocol = url.protocol === "http:" || url.protocol === "ws:" ? "ws:" : "wss:";
+  url.pathname = `/v1/rooms/${encodeURIComponent(room)}`;
+  url.search = `?role=${role}&v=${PROTOCOL_VERSION}`;
+  return url.toString();
 }
 
 /**
- * Parse a browser/Worker WebSocket payload before dispatching it. A character
- * limit is enforced before JSON.parse so a malformed client cannot make a room
- * spend unbounded CPU parsing a message.
+ * Binary packet batch:
+ *   u8 version (1) | u8 kind (1 = packets) | u16 LE count | count x (u16 LE length | bytes)
  */
-export function parseWireMessage(payload) {
-  if (typeof payload !== "string") {
-    return { ok: false, error: "binary_messages_are_not_supported" };
-  }
+export const BATCH_VERSION = 1;
+export const BATCH_KIND_PACKETS = 1;
 
-  if (payload.length === 0 || payload.length > MAX_WIRE_CHARS) {
-    return { ok: false, error: "message_too_large" };
+export function encodePackets(packets) {
+  let size = 4;
+  for (const packet of packets) size += 2 + packet.byteLength;
+  if (packets.length > 0xffff || size > MAX_BINARY_BYTES) throw new RangeError("packet batch too large");
+  const out = new Uint8Array(size);
+  const view = new DataView(out.buffer);
+  out[0] = BATCH_VERSION;
+  out[1] = BATCH_KIND_PACKETS;
+  view.setUint16(2, packets.length, true);
+  let offset = 4;
+  for (const packet of packets) {
+    if (packet.byteLength > MAX_PACKET_BYTES) throw new RangeError("packet too large");
+    view.setUint16(offset, packet.byteLength, true);
+    out.set(packet, offset + 2);
+    offset += 2 + packet.byteLength;
   }
+  return out;
+}
 
+/** Returns an array of Uint8Array views, or null for a malformed batch. */
+export function decodePackets(data) {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data);
+  if (bytes.byteLength < 4 || bytes[0] !== BATCH_VERSION || bytes[1] !== BATCH_KIND_PACKETS) return null;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint16(2, true);
+  const packets = [];
+  let offset = 4;
+  for (let i = 0; i < count; i += 1) {
+    if (offset + 2 > bytes.byteLength) return null;
+    const length = view.getUint16(offset, true);
+    offset += 2;
+    if (length > MAX_PACKET_BYTES || offset + length > bytes.byteLength) return null;
+    packets.push(bytes.subarray(offset, offset + length));
+    offset += length;
+  }
+  return offset === bytes.byteLength ? packets : null;
+}
+
+/** Parses a text frame into a control message, or null. */
+export function parseControl(text) {
+  if (typeof text !== "string" || text.length > MAX_TEXT_BYTES) return null;
+  let value;
   try {
-    const value = JSON.parse(payload);
-    return isRecord(value)
-      ? { ok: true, value }
-      : { ok: false, error: "message_must_be_an_object" };
+    value = JSON.parse(text);
   } catch {
-    return { ok: false, error: "invalid_json" };
+    return null;
   }
+  if (!value || typeof value !== "object" || Array.isArray(value) || typeof value.t !== "string" || value.t.length > 32) {
+    return null;
+  }
+  return value;
 }
 
-/** Validate a message received by the Durable Object from a browser. */
-export function validateClientMessage(message) {
-  if (!isRecord(message) || !isValidProtocolVersion(message.v) || typeof message.type !== "string") {
-    return { ok: false, error: "invalid_message" };
-  }
-
-  switch (message.type) {
-    case "hello":
-      return { ok: true, value: message };
-    case "ready":
-      return typeof message.ready === "boolean"
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_ready" };
-    case "input":
-      return isIntegerInRange(message.seq, 0, MAX_SEQUENCE) &&
-        isIntegerInRange(message.tick, 0, MAX_TICK) &&
-        isValidInput(message.input)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_input" };
-    case "snapshot":
-      return isIntegerInRange(message.seq, 0, MAX_SEQUENCE) &&
-        isIntegerInRange(message.tick, 0, MAX_TICK) &&
-        isJsonValue(message.state)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_snapshot" };
-    case "event":
-      return isIntegerInRange(message.seq, 0, MAX_SEQUENCE) &&
-        isIntegerInRange(message.tick, 0, MAX_TICK) &&
-        isValidEvent(message.event)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_event" };
-    default:
-      return { ok: false, error: "unknown_message_type" };
-  }
-}
-
-/** Validate a message received by the browser from the Durable Object. */
-export function validateServerMessage(message) {
-  if (!isRecord(message) || !isValidProtocolVersion(message.v) || typeof message.type !== "string") {
-    return { ok: false, error: "invalid_server_message" };
-  }
-
-  switch (message.type) {
-    case "joined":
-      return typeof message.roomId === "string" &&
-        isIntegerInRange(message.playerId, 0, ROOM_CAPACITY - 1) &&
-        message.capacity === ROOM_CAPACITY
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_joined" };
-    case "room-state":
-      return Array.isArray(message.players) &&
-        message.players.length <= ROOM_CAPACITY &&
-        message.players.every(
-          (player) =>
-            isRecord(player) &&
-            isIntegerInRange(player.playerId, 0, ROOM_CAPACITY - 1) &&
-            typeof player.ready === "boolean",
-        )
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_room_state" };
-    case "match-start":
-      return isIntegerInRange(message.tick, 0, MAX_TICK)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_match_start" };
-    case "input":
-      return message.playerId === 1 &&
-        isIntegerInRange(message.seq, 0, MAX_SEQUENCE) &&
-        isIntegerInRange(message.tick, 0, MAX_TICK) &&
-        isValidInput(message.input)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_relayed_input" };
-    case "snapshot":
-      return message.playerId === 0 &&
-        isIntegerInRange(message.seq, 0, MAX_SEQUENCE) &&
-        isIntegerInRange(message.tick, 0, MAX_TICK) &&
-        isJsonValue(message.state)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_relayed_snapshot" };
-    case "event":
-      return message.playerId === 0 &&
-        isIntegerInRange(message.seq, 0, MAX_SEQUENCE) &&
-        isIntegerInRange(message.tick, 0, MAX_TICK) &&
-        isValidEvent(message.event)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_relayed_event" };
-    case "peer-left":
-      return isIntegerInRange(message.playerId, 0, ROOM_CAPACITY - 1)
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_peer_left" };
-    case "match-ended":
-      return typeof message.reason === "string"
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_match_ended" };
-    case "error":
-      return typeof message.code === "string"
-        ? { ok: true, value: message }
-        : { ok: false, error: "invalid_error" };
-    default:
-      return { ok: false, error: "unknown_server_message_type" };
-  }
-}
-
-export function clientMessage(type, fields = {}) {
-  return { v: PROTOCOL_VERSION, type, ...fields };
-}
-
-export function serverMessage(type, fields = {}) {
-  return { v: PROTOCOL_VERSION, type, ...fields };
-}
-
-export function normalizeInput(input = NEUTRAL_INPUT) {
-  const normalized = { ...NEUTRAL_INPUT, ...input };
-  if (!isValidInput(normalized)) {
-    throw new TypeError("Input must contain finite normalized axes and a uint16 actions mask");
-  }
-  return normalized;
+/** Peer-to-peer control messages may use any type the relay does not reserve. */
+export function isPeerMessage(message) {
+  return message !== null && !RELAY_MESSAGE_TYPES.includes(message.t);
 }

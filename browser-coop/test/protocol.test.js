@@ -2,48 +2,67 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  NEUTRAL_INPUT,
-  clientMessage,
-  normalizeInput,
-  parseWireMessage,
-  validateClientMessage,
-  validateServerMessage,
+  MAX_PACKET_BYTES,
+  createRoomCode,
+  decodePackets,
+  encodePackets,
+  isPeerMessage,
+  normalizeRoomCode,
+  parseControl,
+  relaySocketUrl,
+  ROOM_ID_PATTERN,
 } from "../shared/protocol.js";
 
-test("a guest input frame has a narrow, validated shape", () => {
-  const message = clientMessage("input", {
-    seq: 42,
-    tick: 120,
-    input: { ...NEUTRAL_INPUT, moveX: 1, actions: 5 },
-  });
-
-  assert.deepEqual(validateClientMessage(message), { ok: true, value: message });
-  assert.equal(validateClientMessage({ ...message, input: { ...message.input, actions: -1 } }).ok, false);
-  assert.equal(validateClientMessage({ ...message, input: { moveX: 0 } }).ok, false);
+test("room codes are 16 base32 characters in groups of four and valid room ids", () => {
+  const code = createRoomCode();
+  assert.match(code, /^[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$/);
+  assert.ok(ROOM_ID_PATTERN.test(code));
+  assert.notEqual(createRoomCode(), code);
 });
 
-test("wire parsing rejects oversized, malformed, and binary payloads", () => {
-  assert.deepEqual(parseWireMessage("{not-json"), { ok: false, error: "invalid_json" });
-  assert.deepEqual(parseWireMessage(new ArrayBuffer(2)), {
-    ok: false,
-    error: "binary_messages_are_not_supported",
-  });
-  assert.equal(parseWireMessage("x".repeat(48_001)).error, "message_too_large");
+test("normalizeRoomCode accepts pasted codes and invite links", () => {
+  const code = "abcd-efgh-jkmn-pqrs";
+  assert.equal(normalizeRoomCode(code), code);
+  assert.equal(normalizeRoomCode(" ABCD EFGH JKMN PQRS "), code);
+  assert.equal(normalizeRoomCode("abcdefghjkmnpqrs"), code);
+  assert.equal(normalizeRoomCode(`https://vel.gg/bo1z/?coop=join&room=${code}`), code);
+  assert.equal(normalizeRoomCode("abcd-efgh"), null);
+  assert.equal(normalizeRoomCode("ilou-ilou-ilou-ilou"), null); // look-alike letters are not in the alphabet
+  assert.equal(normalizeRoomCode(42), null);
 });
 
-test("a guest cannot impersonate the host in relay messages", () => {
-  const snapshot = {
-    v: 1,
-    type: "snapshot",
-    playerId: 1,
-    seq: 0,
-    tick: 0,
-    state: { zombies: [] },
-  };
-  assert.equal(validateServerMessage(snapshot).ok, false);
+test("relaySocketUrl builds the room endpoint with role and protocol version", () => {
+  assert.equal(
+    relaySocketUrl("https://relay.example.workers.dev", "abcd-efgh-jkmn-pqrs", "host"),
+    "wss://relay.example.workers.dev/v1/rooms/abcd-efgh-jkmn-pqrs?role=host&v=2",
+  );
+  assert.equal(relaySocketUrl("http://127.0.0.1:8787", "room-1", "guest"), "ws://127.0.0.1:8787/v1/rooms/room-1?role=guest&v=2");
 });
 
-test("normalizeInput fills missing fields but refuses invalid controls", () => {
-  assert.deepEqual(normalizeInput({ moveY: -1 }), { ...NEUTRAL_INPUT, moveY: -1 });
-  assert.throws(() => normalizeInput({ lookX: Infinity }), /finite normalized axes/);
+test("packet batches round-trip and reject malformed input", () => {
+  const packets = [Uint8Array.of(255, 255, 255, 255, 99), new Uint8Array(MAX_PACKET_BYTES).fill(7), new Uint8Array(0)];
+  const decoded = decodePackets(encodePackets(packets));
+  assert.equal(decoded.length, 3);
+  assert.deepEqual([...decoded[0]], [255, 255, 255, 255, 99]);
+  assert.equal(decoded[1].byteLength, MAX_PACKET_BYTES);
+  assert.equal(decoded[2].byteLength, 0);
+
+  const good = encodePackets([Uint8Array.of(1, 2, 3)]);
+  assert.equal(decodePackets(good.subarray(0, good.length - 1)), null); // truncated
+  assert.equal(decodePackets(Uint8Array.of(9, 1, 0, 0)), null); // unknown version
+  const extra = new Uint8Array(good.length + 1);
+  extra.set(good);
+  assert.equal(decodePackets(extra), null); // trailing bytes
+  assert.throws(() => encodePackets([new Uint8Array(MAX_PACKET_BYTES + 1)]), RangeError);
+});
+
+test("control messages need an object with a short string t; relay types are reserved", () => {
+  assert.deepEqual(parseControl('{"t":"info","zone":"zombie_theater"}'), { t: "info", zone: "zombie_theater" });
+  assert.equal(parseControl("not json"), null);
+  assert.equal(parseControl("[1,2]"), null);
+  assert.equal(parseControl('{"type":"info"}'), null);
+  assert.equal(parseControl("x".repeat(5000)), null);
+  assert.equal(isPeerMessage(parseControl('{"t":"state"}')), true);
+  assert.equal(isPeerMessage(parseControl('{"t":"welcome"}')), false);
+  assert.equal(isPeerMessage(null), false);
 });

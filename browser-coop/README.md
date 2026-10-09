@@ -1,110 +1,97 @@
-# BO1 Zombies browser co-op
+# BO1 Zombies co-op for vel.gg
 
-This directory adds the two-player browser networking path without coupling it
-to the decompiled native engine. It has three pieces:
+Two-player co-op for the browser BO1 Zombies at [vel.gg/bo1z](https://vel.gg/bo1z/): one player hosts, the other
+joins with an invite link. It works on the same Wi-Fi or across the internet.
+
+> **Status:** the relay is deployed and tested, and the host side works in the real game (the patched engine loads,
+> waits for player 2 and connects to the relay). Player 2 joining has not been tested end to end yet: if it fails, the
+> Co-op card shows the error, and `__bo1zCoop.log` in the browser console (F12) has the details.
+
+It has two parts:
+
+- **A Chrome extension** (`extension/`). Both players install it. It only runs on vel.gg, and only changes anything
+  when you click **Host** or open an invite link; otherwise the site works exactly as before.
+- **A relay** (`relay/`), a small Cloudflare Worker that passes the game's packets between the two browsers.
+
+## Play
+
+### 1. Install the extension (both players, once)
+
+1. Download this repository (green **Code** button → **Download ZIP**) and unzip it, or `git clone` it.
+2. In Chrome, open `chrome://extensions` and turn on **Developer mode** (top right).
+3. Click **Load unpacked** and select the `browser-coop/extension` folder.
+
+### 2. Host
+
+1. Open [vel.gg/bo1z](https://vel.gg/bo1z/). A **Co-op** card appears in the top-right corner.
+2. Click **Host a game**, then **Copy invite link** and send it to player 2.
+3. Pick a map. Player 2 is taken to the same map automatically.
+4. When the map has loaded, the game waits for player 2 (or click **Start without player 2**). Once the card shows
+   "Player 2: in the game", click the game to start.
+
+### 3. Join
+
+1. Open the invite link (or paste it, or the room code, into the card's **Join** box on vel.gg/bo1z).
+2. Press any key when the page asks, wait for the map to load and for "In the host's game", then click the game.
+
+The host's game is the real one: zombies, rounds and points all live on the host's computer, and player 2 joins it
+like in the original game. The host should keep their tab open for the whole game; switching tabs is fine.
+
+## How it works
+
+The game on vel.gg is the decompiled engine compiled to WebAssembly. Its multiplayer code is all still there (server,
+client, netchan), but the network layer was cut: a player talks to the game server through two in-memory "loopback"
+rings (16 packet slots each) instead of sockets. The extension tunnels those rings between two browsers:
 
 ```text
-Browser host (player 0) ── snapshots/events ──► Durable Object ──► Browser guest (player 1)
-Browser guest (player 1) ───── input frames ──► Durable Object ──► Browser host (player 0)
+Host browser                                        Guest browser
+ server ── ring P (player 2's replies) ──► extension ─► relay ─► extension ─► ring 0 ──► client (player 2)
+ server ◄── ring Q (player 2's packets) ◄─ extension ◄─ relay ◄─ extension ◄─ ring 1 ◄── client (player 2)
 ```
 
-The first browser to join a room is player 0, the authoritative host. It runs
-the simulation and sends compact state snapshots. The second is player 1; it
-sends normalized input frames and renders the host's state. The relay does not
-simulate game state, trust a claimed player ID, or allow the guest to send
-snapshots. If the host leaves, the relay ends the paired match rather than
-promoting a client without the authoritative world state.
+- **Host.** The server sends to a loopback address by writing ring number `port` in memory. The extension allocates
+  memory and chooses a port P so that ring P lands inside it. Packets from player 2 are tagged with port P, so the
+  server treats them as a second player, and its replies land in memory the extension reads. A short patch to
+  `NET_GetLoopPacket` makes the server also read ring Q, which only the extension writes.
+- **Guest.** The game needs its own server to load a map (animations and scripts come from it). So the guest loads the
+  map normally, then the extension freezes the guest's own server (a patch to `SV_Frame`) and runs
+  `connect LOCALHOST`. The guest's client now sends to ring 1, which the extension forwards to the host, and reads
+  ring 0, where the extension writes the host's replies.
+- **The patch.** When co-op is on, the extension adds two short prologues to the engine as the page loads it (about
+  100 bytes, done in the browser in a few milliseconds). They do nothing until the extension sets one of three
+  "mailbox" words: a console command to run, "freeze the local server", and "also read ring Q".
+- **The relay.** A Cloudflare Durable Object per room, holding one host and one guest WebSocket. It forwards binary
+  packet batches and small JSON messages, and never looks inside them.
 
-## Layout
+All engine addresses are in `extension/src/layout.js`, for the exact engine build vel.gg serves (identified by its
+SHA-256). If vel.gg ever ships a different engine, the extension notices, says so in its card, and leaves the game
+solo instead of patching something it does not know.
 
-- `relay/` is the Cloudflare Worker and Durable Object. It uses the hibernation
-  WebSocket API and per-socket attachments so player roles and readiness survive
-  Durable Object hibernation.
-- `shared/protocol.js` is the small, validated JSON wire protocol shared by the
-  Worker and the browser client.
-- `client/src/coop-client.js` owns the browser WebSocket lifecycle.
-- `client/src/authoritative-session.js` adapts an existing fixed-tick game
-  simulation to the host-authoritative flow.
-
-## Run checks
+## Develop
 
 ```sh
 cd browser-coop
 npm install
-npm run check
-npm test
+npm run build        # extension/src -> extension/dist/coop-main.js (commit the result)
+npm test             # protocol, packet rings, engine patch and the relay running locally
+npm run dev:relay    # local relay on http://localhost:8787
+npm run deploy:relay # deploy the relay to Cloudflare (needs `npx wrangler login` once)
 ```
 
-The unit tests exercise the protocol and the browser transport with a fake
-WebSocket. They do not require Cloudflare credentials or a live relay.
+`BO1Z_ENGINE_WASM=/path/to/KisakBlack-web.wasm npm test` also checks the patch against the real engine file.
 
-## Deploy the relay
+`node e2e/coop.mjs` plays a real two-player game on vel.gg with two Chrome profiles (the first run downloads the
+map, about 900 MB per profile). It uses the local relay unless `RELAY=https://...` is set.
 
-Install dependencies once, then set `ALLOWED_ORIGINS` to the exact comma-
-separated origins that serve the browser game. The repository config permits
-only Vite's usual local origins by default; change it before a production
-deployment.
+The extension talks to `https://bo1-zombies-coop-relay.macosapp.workers.dev` by default (`DEFAULT_RELAY` in
+`extension/src/main.js`). To use your own relay, deploy it and change that line, or set it in the browser console on
+vel.gg: `localStorage.setItem("bo1z-coop-relay", "https://your-relay.workers.dev")`.
 
-```sh
-cd browser-coop
-npm install
-npx wrangler deploy --config relay/wrangler.jsonc \
-  --var ALLOWED_ORIGINS:https://play.example.com
-```
+### Relay protocol
 
-The WebSocket endpoint is:
-
-```text
-wss://<worker-domain>/v1/rooms/<lowercase-room-slug>
-```
-
-Room slugs must contain lowercase letters, digits, and hyphens and are limited
-to 48 characters. A `GET /health` endpoint reports the protocol version for
-deployment checks.
-
-## Integrate a browser simulation
-
-```js
-import { CoopClient } from "./client/src/coop-client.js";
-import { AuthoritativeCoopSession } from "./client/src/authoritative-session.js";
-
-const client = new CoopClient({
-  relayUrl: "https://your-relay.workers.dev",
-  roomId: "kino-2p",
-});
-
-const session = new AuthoritativeCoopSession({
-  client,
-  simulation: {
-    step: ({ tick, hostInput, guestInput }) => world.step(tick, hostInput, guestInput),
-    createSnapshot: () => world.serialize(),
-    applySnapshot: ({ tick, state }) => world.applyAuthoritativeState(tick, state),
-    applyEvent: ({ tick, event }) => world.applyEvent(tick, event),
-  },
-  snapshotEveryTicks: 3,
-});
-
-client.connect();
-session.start();
-
-// Invoke from the game's fixed-update loop with this browser's local controls.
-function fixedUpdate(tick, localInput) {
-  session.tick(tick, localInput);
-}
-```
-
-Wait for `client.status === "playing"` before starting a round. Player 0
-simulates both players on each fixed tick. Player 1 sends its local input and
-applies snapshots, so its client never becomes a competing authority.
-
-## Protocol contracts
-
-Every message has `{ v: 1, type: "..." }`. The guest may send only `input`;
-the host may send only `snapshot` and `event` game payloads. `ready` and
-`hello` are control messages available to both players. Input axes are finite
-values in `[-1, 1]`, and `actions` is a uint16 bit mask.
-
-Snapshots are intentionally game-defined JSON data. Keep them below the
-48,000-character protocol limit and include only the state a remote renderer
-needs. Send reliable one-off effects such as a round transition through `event`
-instead of trying to infer them from two snapshots.
+`wss://<relay>/v1/rooms/<room>?role=host|guest&v=2`. Text frames are JSON objects with a string `t`: the relay sends
+`welcome {role, peer}`, `peer {present}` and `error {code}`; anything else (`info`, `state`, `ping`, `pong`) is
+forwarded to the other player. Binary frames are packet batches (`shared/protocol.js`):
+`u8 version | u8 kind | u16 count | count × (u16 length | bytes)`, each packet at most 1264 bytes.
+A new connection for a role replaces the old one (a reload). The relay allows only `https://vel.gg` as a browser origin
+(`ALLOWED_ORIGINS` in `relay/wrangler.jsonc`).

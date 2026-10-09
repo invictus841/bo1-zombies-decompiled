@@ -1,5 +1,5 @@
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
+  "$schema": "../node_modules/wrangler/config-schema.json",
   "name": "bo1-zombies-coop-relay",
   "main": "src/index.js",
   "compatibility_date": "2026-10-08",
@@ -17,7 +17,9 @@
       "new_sqlite_classes": ["RoomRelay"]
     }
   ],
+  "observability": { "enabled": true },
   "vars": {
-    "ALLOWED_ORIGINS": "http://localhost:5173,http://127.0.0.1:5173"
+    // Pages allowed to open rooms. Requests without an Origin header (tools, tests) are also accepted.
+    "ALLOWED_ORIGINS": "https://vel.gg"
   }
 }

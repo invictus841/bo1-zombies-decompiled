@@ -6,12 +6,8 @@ Decompiled engine code for Black Ops 1 Zombies, so mods can change the engine it
 
 ![](images/2.webp)
 
-## Browser co-op relay
+## Co-op on vel.gg (browser)
 
-The native engine remains the primary project. A standalone, browser-facing two-player
-co-op networking layer lives in [`browser-coop/`](browser-coop/). It uses a
-Cloudflare Durable Object as a room-scoped WebSocket relay: player 0 is the
-authoritative host, and player 1 sends inputs while receiving host snapshots.
-
-See [`browser-coop/README.md`](browser-coop/README.md) for the protocol,
-deployment steps, and the small client adapter used to connect a browser game.
+[`browser-coop/`](browser-coop/) adds two-player co-op to the browser version of the game at
+[vel.gg/bo1z](https://vel.gg/bo1z/): a Chrome extension (both players install it) and a small Cloudflare relay that
+connects the two browsers. See [`browser-coop/README.md`](browser-coop/README.md) to install and play.
