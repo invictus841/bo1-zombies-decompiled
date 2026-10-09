@@ -92,6 +92,7 @@ function start() {
     },
     leave: () => { coop.pump?.postMessage({ type: "close" }); go(location.pathname); },
     startNow: () => { coop.startAlone = true; },
+    rejoin: () => location.reload(),
     controller: () => {
       coop.controller = !coop.controller;
       saveSetting("bo1z-coop-controller", coop.controller ? "1" : "0");
@@ -253,7 +254,7 @@ function onControl(coop, message) {
     case "peer":
       coop.peer = Boolean(message.present);
       if (coop.peer) { coop.peerSeenAt = Date.now(); greet(coop); }
-      else coop.peerLeftAt = Date.now();
+      else { coop.peerLeftAt = Date.now(); coop.remotePause = false; }
       coop.note(`other player ${coop.peer ? "joined the room" : "left the room"}`);
       return;
     case "error":
@@ -265,12 +266,16 @@ function onControl(coop, message) {
     case "state":
       coop.peerState = message;
       return;
+    case "pause":
+      coop.remotePause = Boolean(message.on);
+      return;
   }
 }
 
 function greet(coop) {
-  if (coop.mode === "host") sendInfo(coop);
+  if (coop.mode === "host") { sendInfo(coop); coop.lastStateKey = null; }
   else send(coop, { t: "state", phase: coop.phase, v: VERSION });
+  send(coop, { t: "pause", on: Boolean(coop.menuOpen) });
 }
 
 function sendInfo(coop) {
@@ -386,28 +391,88 @@ function hostTick(coop) {
     mem.Module._KB_Input?.(7, 1, 0);
     coop.note("released the start hold so player 2 can join");
   }
+  const guestActive = slot?.state === CLIENT_STATE.active;
   // A paused server ignores join requests, and alone the host's server pauses on the start screen (intro hold) and
-  // in the pause menu. While player 2 is in the room but not in the game yet, keep it running. (With two players
-  // in the game the server never pauses anyway.)
-  if (mem && coop.peer && !(slot && slot.state === CLIENT_STATE.active)) {
+  // in the pause menu. While player 2 is in the room but not in the game yet, keep it running.
+  if (mem && coop.peer && !guestActive) {
     if (mem.dvarInt("clPaused")) mem.setDvarInt("clPaused", 0);
     if (mem.dvarInt("svPaused")) mem.setDvarInt("svPaused", 0);
   }
-  // The guest closed its page: free its slot once it is clearly gone (a reload comes back within seconds).
-  if (slot && !coop.peer && coop.peerLeftAt && Date.now() - coop.peerLeftAt > KICK_AFTER_MS && coop.kickedAt !== coop.peerLeftAt) {
-    if (mem.command(`clientkick ${slot.slot}`)) {
-      coop.kickedAt = coop.peerLeftAt;
-      coop.note(`removed player 2 (slot ${slot.slot})`);
-    }
+  // Either player's game menu pauses both games (pauseHost / pauseGuest).
+  const menuOpen = Boolean(mem?.menuOpen()) && screen === "playing";
+  if (menuOpen !== coop.menuOpen) {
+    coop.menuOpen = menuOpen;
+    if (coop.peer) send(coop, { t: "pause", on: menuOpen });
+  }
+  if (mem) pauseHost(coop, guestActive && (menuOpen || (coop.peer && coop.remotePause)), menuOpen);
+  // Free player 2's slot when it is gone or about to join again (a reload after a crash): the server refuses a
+  // second connection from a slot that is still in the game.
+  const guestPhase = coop.peerState?.phase;
+  const stale = slot && slot.state >= CLIENT_STATE.connected && (
+    (coop.peer && ["freezing", "connect", "ended", "failed"].includes(guestPhase)) ||
+    (!coop.peer && coop.peerLeftAt && Date.now() - coop.peerLeftAt > KICK_AFTER_MS));
+  if (stale && Date.now() - (coop.lastKickAt ?? 0) > 5000 && mem.command(`clientkick ${slot.slot}`)) {
+    coop.lastKickAt = Date.now();
+    coop.note(`removed player 2 (slot ${slot.slot}, ${coop.peer ? guestPhase : "left"})`);
   }
 }
 
-// Guest phases in which our client talks to the host. Pausing them would only stop our moves reaching the host
-// (our own server is frozen), so the pause menu and the start hold must not pause the client.
-const GUEST_LINKED = ["challenging", "joining", "connected"];
+// Both games pause while either player's game menu is open. The engine pauses a server only with fewer than two
+// players, so the host freezes its server itself (the FREEZE mailbox) and sets the dvars the engine's own pause
+// sets: with sv_paused and cl_paused both on, the client clock stops and the connection timeout is skipped. The
+// guest sets the same dvars (its server is frozen anyway). While paused, and once on resume, the client's
+// last-packet time is held at 0, which also skips the timeout, so the two sides need not resume on the same frame.
+function pauseHost(coop, paused, menuOpen) {
+  const mem = coop.mem;
+  if (paused) {
+    if (!coop.pausedApplied) coop.note(`paused${menuOpen ? "" : " by player 2"}`);
+    mem.setFreeze(true);
+    if (!mem.dvarInt("svPaused")) mem.setDvarInt("svPaused", 1);
+    if (!mem.dvarInt("clPaused")) mem.setDvarInt("clPaused", 1);
+    mem.clearLastPacketTime();
+  } else if (coop.pausedApplied) {
+    mem.setFreeze(false);
+    mem.setDvarInt("svPaused", 0);
+    if (!menuOpen) mem.setDvarInt("clPaused", 0);
+    mem.clearLastPacketTime();
+    coop.note("resumed");
+  }
+  coop.pausedApplied = paused;
+}
+
+function pauseGuest(coop, screen) {
+  const mem = coop.mem;
+  const menuOpen = mem.menuOpen() && screen === "playing";
+  if (menuOpen !== coop.menuOpen) {
+    coop.menuOpen = menuOpen;
+    if (coop.peer) send(coop, { t: "pause", on: menuOpen });
+  }
+  const paused = menuOpen || (coop.peer && Boolean(coop.remotePause));
+  if (paused) {
+    if (!coop.pausedApplied) coop.note(`paused${menuOpen ? "" : " by the host"}`);
+    if (!mem.dvarInt("svPaused")) mem.setDvarInt("svPaused", 1);
+    if (!mem.dvarInt("clPaused")) mem.setDvarInt("clPaused", 1);
+    mem.clearLastPacketTime();
+  } else {
+    if (coop.pausedApplied) { mem.clearLastPacketTime(); coop.note("resumed"); }
+    if (mem.dvarInt("svPaused")) mem.setDvarInt("svPaused", 0);
+    if (mem.dvarInt("clPaused")) mem.setDvarInt("clPaused", 0);
+  }
+  coop.pausedApplied = paused;
+}
+
+// Guest phases in which our client is joining the host. A paused client sends no moves, and the host's server
+// times a joining player out while it waits for the first one, so the start hold must not pause it then.
+const GUEST_JOINING = ["challenging", "joining"];
 
 function guestTick(coop) {
-  if (coop.mem && GUEST_LINKED.includes(coop.phase)) {
+  const screen = window.five?.screen;
+  // The engine stopped (vel.gg shows its error screen): tell the host, which frees our slot, and offer Rejoin.
+  if (screen === "error" && !["ended", "failed"].includes(coop.phase)) {
+    coop.phase = "ended";
+    coop.note("engine stopped");
+  }
+  if (coop.mem && GUEST_JOINING.includes(coop.phase)) {
     if (coop.mem.dvarInt("clPaused")) coop.mem.setDvarInt("clPaused", 0);
     if (coop.mem.dvarInt("svPaused")) coop.mem.setDvarInt("svPaused", 0);
   }
@@ -417,7 +482,6 @@ function guestTick(coop) {
   }
   if (!coop.peer) coop.sentPhase = null;
   const mem = coop.mem;
-  const screen = window.five?.screen;
   const conn = mem?.connectionState();
   const hostReady = coop.peer && coop.peerState?.ready;
   switch (coop.phase) {
@@ -449,6 +513,10 @@ function guestTick(coop) {
         coop.introReleased = true;
         mem.Module._KB_Input?.(7, 1, 0);
       }
+      // After a crash our old slot may still be in the host's game: the host frees it when it sees this phase,
+      // and we wait for it to be gone (the server refuses a second connection from a slot still in the game).
+      coop.connectWaitAt ??= Date.now();
+      if ((coop.peerState?.slot ?? 0) >= CLIENT_STATE.connected && Date.now() - coop.connectWaitAt < 20000) break;
       // "LOCALHOST", not "localhost": the exact lowercase name would also shut our local server down.
       if (mem.command("connect LOCALHOST")) {
         coop.joinedLate = coop.peerState?.screen === "playing";
@@ -486,6 +554,8 @@ function guestTick(coop) {
         coop.phase = "ended";
         coop.notice = "The host left the game.";
         mem.command("disconnect");
+      } else {
+        pauseGuest(coop, screen);
       }
       break;
     default:
@@ -518,7 +588,8 @@ function view(coop) {
   if (coop.mode === "host") {
     const slot = coop.guestSlot;
     const guestJoining = ["freezing", "connect", "challenging", "joining"].includes(coop.peerState?.phase);
-    const p2 = !coop.peer ? (slot ? "reconnecting…" : "not here yet") : !slot ? (guestJoining ? "joining…" : "loading the map…") : slot.state === CLIENT_STATE.active ? "in the game" : "joining…";
+    const gone = ["ended", "failed"].includes(coop.peerState?.phase);
+    const p2 = !coop.peer ? (slot ? "reconnecting…" : "not here yet") : gone ? "disconnected (they can rejoin)" : !slot ? (guestJoining ? "joining…" : "loading the map…") : slot.state === CLIENT_STATE.active ? "in the game" : "joining…";
     if (slot?.state === CLIENT_STATE.active && coop.peer) tone = "ok";
     blocks.push({ kind: "text", text: "You are hosting. Send this invite link to player 2:" });
     blocks.push({ kind: "code", text: coop.room });
@@ -532,7 +603,8 @@ function view(coop) {
     } else if (!(slot?.state === CLIENT_STATE.active)) {
       blocks.push({ kind: "text", cls: "muted small", text: "If you start before player 2 is in, they watch until the next round (the BO1 rule for latecomers)." });
     }
-    pill = `Co-op · P2 ${slot?.state === CLIENT_STATE.active && coop.peer ? "in" : "not in"} · ${rtt}`;
+    if (coop.pausedApplied) blocks.push({ kind: "text", text: coop.menuOpen ? "Paused. Player 2 is paused too." : "Paused by player 2." });
+    pill = coop.pausedApplied ? `Co-op · ${coop.menuOpen ? "paused" : "paused by P2"}` : `Co-op · P2 ${slot?.state === CLIENT_STATE.active && coop.peer ? "in" : "not in"} · ${rtt}`;
   } else {
     const host = coop.peerInfo?.slug ? MAP_NAMES[coop.peerInfo.slug] : null;
     const steps = {
@@ -545,8 +617,8 @@ function view(coop) {
       challenging: "Connecting…",
       joining: "Joining the host's game…",
       connected: "In the host's game.",
-      ended: "Disconnected from the host.",
-      failed: "Could not join.",
+      ended: "Disconnected from the host. You can rejoin while the host keeps playing.",
+      failed: "Could not join. Try again.",
     };
     if (coop.phase === "connected") tone = "ok";
     const onHostMap = coop.peerInfo?.slug && currentSlug() === coop.peerInfo.slug;
@@ -559,7 +631,9 @@ function view(coop) {
     }
     blocks.push({ kind: "lines", lines: [["Room", coop.room], ["Relay", relay], ["Host", coop.peer ? "here" : "not here"], ["Ping", rtt]] });
     if (coop.phase === "connected" && screen === "ready") blocks.push({ kind: "text", cls: "muted small", text: "Click the game to play." });
-    pill = `Co-op · ${coop.phase === "connected" ? "with host" : steps[coop.phase] ?? ""} · ${rtt}`;
+    if (coop.phase === "connected" && coop.pausedApplied) blocks.push({ kind: "text", text: coop.menuOpen ? "Paused. The host is paused too." : "Paused by the host." });
+    if (["ended", "failed"].includes(coop.phase)) blocks.push({ kind: "buttons", buttons: [{ act: "rejoin", label: "Rejoin", primary: true }] });
+    pill = coop.phase === "connected" && coop.pausedApplied ? `Co-op · ${coop.menuOpen ? "paused" : "paused by host"}` : `Co-op · ${coop.phase === "connected" ? "with host" : steps[coop.phase] ?? ""} · ${rtt}`;
   }
   if (coop.stats?.lost) blocks.push({ kind: "text", cls: "muted small", text: `${coop.stats.lost} packets dropped` });
   blocks.push(...controllerBlocks(coop));

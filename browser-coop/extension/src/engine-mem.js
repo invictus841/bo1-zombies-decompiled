@@ -63,6 +63,14 @@ export class EngineMemory {
     Atomics.store(this.u16, (clc + this.layout.client.serverAddressPort) >> 1, port);
     return true;
   }
+  /** Zeroes the client's last-packet time: the engine skips its connection timeout while it is 0. */
+  clearLastPacketTime() {
+    const clc = this.int(this.layout.client.clcPtr);
+    if (clc) this.setInt(clc + this.layout.client.lastPacketTime, 0);
+  }
+  /** A game menu (pause menu, options, ...) owns the cursor. */
+  menuOpen() { return Boolean(this.Module._KB_UIState?.() & 1); }
+
   serverAddressPort() {
     const clc = this.int(this.layout.client.clcPtr);
     return clc ? Atomics.load(this.u16, (clc + this.layout.client.serverAddressPort) >> 1) : null;

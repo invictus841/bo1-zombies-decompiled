@@ -60,6 +60,15 @@ controller start the sound or capture the mouse), then play with the controller.
 The controller uses the engine's own actions through the extension's patched engine, so when it is on the engine is
 patched in solo games too. **Turn controller off** in the card (then reload) to leave solo games untouched.
 
+### Pausing, and coming back after a disconnect
+
+Either player's pause menu (Escape, or Options on a controller) pauses the game for both: zombies stop on both
+screens until that menu is closed. The card says who paused.
+
+If player 2's game stops (an error screen, a closed tab), the host keeps playing and player 2's slot is freed.
+Player 2 clicks **Rejoin** on the card (or opens the invite link again) and joins the same game; if a round is in
+progress they watch until the next one, the BO1 rule for latecomers.
+
 The host's game is the real one: zombies, rounds and points all live on the host's computer, and player 2 joins it
 like in the original game. The host should keep their tab open for the whole game; switching tabs is fine.
 

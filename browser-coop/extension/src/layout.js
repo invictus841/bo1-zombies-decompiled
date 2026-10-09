@@ -37,6 +37,7 @@ export const BUILDS = {
       connectionState: 13391960, // i32 clientUIActive.connectionState: 5 challenging .. 10 active
       clcPtr: 43783020, // clientConnection_t* (serverAddress.port is a u16 at +24)
       serverAddressPort: 24,
+      lastPacketTime: 12, // i32 clc->lastPacketTime; the engine skips its connection timeout while it is 0
     },
     // Pointers to dvar_s; the current value is at +24.
     dvars: { comSvRunning: 134904904, svPaused: 134904892, clPaused: 134904896, comMaxClients: 134904752 },
