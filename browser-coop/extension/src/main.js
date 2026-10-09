@@ -272,8 +272,7 @@ function onControl(coop, message) {
       return;
     case "pos":
       if (Array.isArray(message.o) && message.o.length === 3 && message.o.every(Number.isFinite)) {
-        coop.hostPos = { origin: message.o, yaw: Number(message.a?.[1]) || 0, at: Date.now(), previous: coop.hostPos ?? null };
-        if (coop.hostPos.previous) coop.hostPos.previous.previous = null;
+        coop.hostPos = { origin: message.o, at: Date.now() };
       }
       return;
   }
@@ -460,38 +459,45 @@ function latestView() {
 }
 
 const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
-const SPAWN_JUMP = 400, FAR_FROM_HOST = 300, TELEPORT_COOLDOWN_MS = 6000, HOST_POS_MAX_AGE_MS = 6000;
+const SPAWN_JUMP = 400, FAR_FROM_HOST = 300, HOST_POS_MAX_AGE_MS = 6000, SPAWN_CHECK_MS = 2000, SPAWN_RETRIES = 2;
 
-// Each map places player 2's spawn point wherever its makers chose, sometimes far from player 1's. Whenever our
-// player appears somewhere new (a spawn, a respawn) far from the host, move next to the host.
+// Each map places player 2's spawn point wherever its makers chose, sometimes far from player 1's (on Five, this
+// build's one is outside the rooms). Whenever our player appears somewhere new (a spawn, a respawn) far from the
+// host, move onto the host's spot. The move stays pending until a fresh host position is known, and is checked
+// two seconds later in case the command did not take.
 function followHost(coop) {
   const view = latestView();
-  if (!view || view.ms === coop.lastViewMs) return;
-  const previous = coop.lastViewOrigin;
-  coop.lastViewMs = view.ms;
-  coop.lastViewOrigin = view.origin;
-  const jumped = !previous || distance(previous, view.origin) > SPAWN_JUMP;
-  const host = coop.hostPos;
-  if (!jumped || !host || Date.now() - host.at > HOST_POS_MAX_AGE_MS || coop.pausedApplied) return;
-  if (distance(host.origin, view.origin) > FAR_FROM_HOST) teleportToHost(coop, "spawn");
+  if (view && view.ms !== coop.lastViewMs) {
+    const previous = coop.lastViewOrigin;
+    coop.lastViewMs = view.ms;
+    coop.lastViewOrigin = view.origin;
+    if (!previous || distance(previous, view.origin) > SPAWN_JUMP) spawnPending(coop);
+  }
+  const pending = coop.spawn;
+  if (!pending || coop.pausedApplied) return;
+  const host = coop.hostPos, mine = coop.lastViewOrigin;
+  if (!host || Date.now() - host.at > HOST_POS_MAX_AGE_MS || !mine) return;
+  if (pending.sentAt && Date.now() - pending.sentAt < SPAWN_CHECK_MS) return;
+  if (distance(host.origin, mine) <= FAR_FROM_HOST) { coop.spawn = null; return; }
+  if (pending.tries >= SPAWN_RETRIES) { coop.spawn = null; coop.note("could not move next to the host"); return; }
+  if (teleportToHost(coop, pending.tries ? "spawn, retry" : "spawn")) { pending.sentAt = Date.now(); pending.tries += 1; }
+}
+
+function spawnPending(coop) {
+  if (!coop.spawn) coop.spawn = { tries: 0, sentAt: 0 };
 }
 
 // "setviewpos x y z" is a client command the server carries out on the player who sent it (cheats are on: the
-// page starts every map with devmap). Target: where the host stood a second ago (a spot a player can stand on, now
-// free), or just beside the host when the host has not moved.
+// page starts every map with devmap). The target is the host's own spot: a place a player can stand, and
+// players do not block each other in BO1 zombies.
 function teleportToHost(coop, why) {
   const mem = coop.mem, host = coop.hostPos;
   if (!mem || coop.phase !== "connected" || !host) return false;
-  if (Date.now() - (coop.teleportedAt ?? 0) < (why === "button" ? 1000 : TELEPORT_COOLDOWN_MS)) return false;
-  let target = host.previous && distance(host.previous.origin, host.origin) >= 48 ? host.previous.origin : null;
-  if (!target) {
-    const yaw = (host.yaw * Math.PI) / 180;
-    target = [host.origin[0] + Math.sin(yaw) * 40, host.origin[1] - Math.cos(yaw) * 40, host.origin[2]];
-  }
-  const text = `setviewpos ${target.map((v) => v.toFixed(1)).join(" ")}`;
+  if (Date.now() - (coop.teleportedAt ?? 0) < 1000) return false;
+  const text = `setviewpos ${host.origin.map((v) => v.toFixed(1)).join(" ")}`;
   if (!mem.command(text)) return false;
   coop.teleportedAt = Date.now();
-  coop.note(`moved next to the host (${why})`);
+  coop.note(`moved to the host (${why})`);
   return true;
 }
 
@@ -595,6 +601,8 @@ function guestTick(coop) {
       if (mem.serverAddressPort() !== 0) mem.setServerAddressPort(0);
       if (conn === CONNECTION.active) {
         coop.phase = "connected";
+        coop.lastViewOrigin = null;
+        spawnPending(coop);
         coop.note("connected to host");
       } else if (Date.now() - coop.connectAt > 90000) {
         coop.error = "The host did not let us in. Reload both pages and try again.";
