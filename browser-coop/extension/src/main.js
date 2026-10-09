@@ -93,6 +93,7 @@ function start() {
     leave: () => { coop.pump?.postMessage({ type: "close" }); go(location.pathname); },
     startNow: () => { coop.startAlone = true; },
     rejoin: () => location.reload(),
+    goToHost: () => { teleportToHost(coop, "button"); },
     controller: () => {
       coop.controller = !coop.controller;
       saveSetting("bo1z-coop-controller", coop.controller ? "1" : "0");
@@ -269,6 +270,12 @@ function onControl(coop, message) {
     case "pause":
       coop.remotePause = Boolean(message.on);
       return;
+    case "pos":
+      if (Array.isArray(message.o) && message.o.length === 3 && message.o.every(Number.isFinite)) {
+        coop.hostPos = { origin: message.o, yaw: Number(message.a?.[1]) || 0, at: Date.now(), previous: coop.hostPos ?? null };
+        if (coop.hostPos.previous) coop.hostPos.previous.previous = null;
+      }
+      return;
   }
 }
 
@@ -405,6 +412,12 @@ function hostTick(coop) {
     if (coop.peer) send(coop, { t: "pause", on: menuOpen });
   }
   if (mem) pauseHost(coop, guestActive && (menuOpen || (coop.peer && coop.remotePause)), menuOpen);
+  // Player 2's extension keeps player 2 next to the host (teleportToHost): send where the host is, once a second.
+  const view = latestView();
+  if (coop.peer && guestActive && view && view.ms !== coop.sentViewMs) {
+    coop.sentViewMs = view.ms;
+    send(coop, { t: "pos", o: view.origin, a: view.angles });
+  }
   // Free player 2's slot when it is gone or about to join again (a reload after a crash): the server refuses a
   // second connection from a slot that is still in the game.
   const guestPhase = coop.peerState?.phase;
@@ -438,6 +451,48 @@ function pauseHost(coop, paused, menuOpen) {
     coop.note("resumed");
   }
   coop.pausedApplied = paused;
+}
+
+// The engine prints the local player's position once a second; the page keeps the parsed lines.
+function latestView() {
+  const view = window.five?.views?.at(-1);
+  return view && Array.isArray(view.origin) && view.origin.length === 3 && view.origin.every(Number.isFinite) ? view : null;
+}
+
+const distance = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const SPAWN_JUMP = 400, FAR_FROM_HOST = 300, TELEPORT_COOLDOWN_MS = 6000, HOST_POS_MAX_AGE_MS = 6000;
+
+// Each map places player 2's spawn point wherever its makers chose, sometimes far from player 1's. Whenever our
+// player appears somewhere new (a spawn, a respawn) far from the host, move next to the host.
+function followHost(coop) {
+  const view = latestView();
+  if (!view || view.ms === coop.lastViewMs) return;
+  const previous = coop.lastViewOrigin;
+  coop.lastViewMs = view.ms;
+  coop.lastViewOrigin = view.origin;
+  const jumped = !previous || distance(previous, view.origin) > SPAWN_JUMP;
+  const host = coop.hostPos;
+  if (!jumped || !host || Date.now() - host.at > HOST_POS_MAX_AGE_MS || coop.pausedApplied) return;
+  if (distance(host.origin, view.origin) > FAR_FROM_HOST) teleportToHost(coop, "spawn");
+}
+
+// "setviewpos x y z" is a client command the server carries out on the player who sent it (cheats are on: the
+// page starts every map with devmap). Target: where the host stood a second ago (a spot a player can stand on, now
+// free), or just beside the host when the host has not moved.
+function teleportToHost(coop, why) {
+  const mem = coop.mem, host = coop.hostPos;
+  if (!mem || coop.phase !== "connected" || !host) return false;
+  if (Date.now() - (coop.teleportedAt ?? 0) < (why === "button" ? 1000 : TELEPORT_COOLDOWN_MS)) return false;
+  let target = host.previous && distance(host.previous.origin, host.origin) >= 48 ? host.previous.origin : null;
+  if (!target) {
+    const yaw = (host.yaw * Math.PI) / 180;
+    target = [host.origin[0] + Math.sin(yaw) * 40, host.origin[1] - Math.cos(yaw) * 40, host.origin[2]];
+  }
+  const text = `setviewpos ${target.map((v) => v.toFixed(1)).join(" ")}`;
+  if (!mem.command(text)) return false;
+  coop.teleportedAt = Date.now();
+  coop.note(`moved next to the host (${why})`);
+  return true;
 }
 
 function pauseGuest(coop, screen) {
@@ -556,6 +611,7 @@ function guestTick(coop) {
         mem.command("disconnect");
       } else {
         pauseGuest(coop, screen);
+        followHost(coop);
       }
       break;
     default:
@@ -632,6 +688,7 @@ function view(coop) {
     blocks.push({ kind: "lines", lines: [["Room", coop.room], ["Relay", relay], ["Host", coop.peer ? "here" : "not here"], ["Ping", rtt]] });
     if (coop.phase === "connected" && screen === "ready") blocks.push({ kind: "text", cls: "muted small", text: "Click the game to play." });
     if (coop.phase === "connected" && coop.pausedApplied) blocks.push({ kind: "text", text: coop.menuOpen ? "Paused. The host is paused too." : "Paused by the host." });
+    if (coop.phase === "connected" && coop.hostPos) blocks.push({ kind: "buttons", buttons: [{ act: "goToHost", label: "Go to player 1" }] });
     if (["ended", "failed"].includes(coop.phase)) blocks.push({ kind: "buttons", buttons: [{ act: "rejoin", label: "Rejoin", primary: true }] });
     pill = coop.phase === "connected" && coop.pausedApplied ? `Co-op · ${coop.menuOpen ? "paused" : "paused by host"}` : `Co-op · ${coop.phase === "connected" ? "with host" : steps[coop.phase] ?? ""} · ${rtt}`;
   }

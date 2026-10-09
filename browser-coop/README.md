@@ -69,6 +69,12 @@ If player 2's game stops (an error screen, a closed tab), the host keeps playing
 Player 2 clicks **Rejoin** on the card (or opens the invite link again) and joins the same game; if a round is in
 progress they watch until the next one, the BO1 rule for latecomers.
 
+### Spawning next to each other
+
+Each map places player 2's spawn point wherever its makers chose, on some maps far from player 1's (Verrückt
+splits the players on purpose). Whenever player 2 appears somewhere new (a spawn or a respawn) far from the host,
+the extension moves them next to the host. Player 2's card also has **Go to player 1** for when you get separated.
+
 The host's game is the real one: zombies, rounds and points all live on the host's computer, and player 2 joins it
 like in the original game. The host should keep their tab open for the whole game; switching tabs is fine.
 
