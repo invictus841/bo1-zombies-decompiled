@@ -488,13 +488,17 @@ function spawnPending(coop) {
 }
 
 // "setviewpos x y z" is a client command the server carries out on the player who sent it (cheats are on: the
-// page starts every map with devmap). The target is the host's own spot: a place a player can stand, and
-// players do not block each other in BO1 zombies.
+// page starts every map with devmap). It takes an eye position and lowers it by the sender's current eye height
+// to place the feet, while the host reports its feet: raise it by a standing eye height (60) plus a margin, so a
+// crouched player 2 drops a few units onto the floor instead of sinking into it. The target is the host's own
+// spot: a place a player can stand, and players do not block each other in BO1 zombies.
+const EYE_HEIGHT = 62;
 function teleportToHost(coop, why) {
   const mem = coop.mem, host = coop.hostPos;
   if (!mem || coop.phase !== "connected" || !host) return false;
   if (Date.now() - (coop.teleportedAt ?? 0) < 1000) return false;
-  const text = `setviewpos ${host.origin.map((v) => v.toFixed(1)).join(" ")}`;
+  const target = [host.origin[0], host.origin[1], host.origin[2] + EYE_HEIGHT];
+  const text = `setviewpos ${target.map((v) => v.toFixed(1)).join(" ")}`;
   if (!mem.command(text)) return false;
   coop.teleportedAt = Date.now();
   coop.note(`moved to the host (${why})`);
@@ -632,7 +636,8 @@ function guestTick(coop) {
 function view(coop) {
   const blocks = [];
   const screen = window.five?.screen;
-  const playing = screen === "playing";
+  // While playing the card shrinks to a pill; it comes back whenever a game menu is open (Escape frees the mouse).
+  const playing = screen === "playing" && !coop.mem?.menuOpen();
   if (coop.error) blocks.push({ kind: "text", cls: "error", text: coop.error });
   if (coop.notice) blocks.push({ kind: "text", cls: "muted small", text: coop.notice });
 
