@@ -23,6 +23,7 @@ input:focus { border-color: #999; }
 .pill { display: none; }
 :host(.compact) .card { display: none; }
 :host(.compact) .pill { display: block; pointer-events: none; background: rgba(0,0,0,.55); border-radius: 12px; padding: 3px 10px; font-size: 12px; color: #ddd; }
+:host(.compact) .pill:empty { display: none; }
 :host(.collapsed) .body { display: none; }
 `;
 

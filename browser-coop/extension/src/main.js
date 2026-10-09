@@ -11,6 +11,7 @@ import { EngineMemory } from "./engine-mem.js";
 import { ringOffsets } from "./rings.js";
 import { createRoomCode, normalizeRoomCode } from "../../shared/protocol.js";
 import { Panel } from "./ui.js";
+import { GamepadControl, AIM_SPEEDS } from "./gamepad.js";
 
 /* global __PUMP_SOURCE__, __VERSION__ */
 const VERSION = __VERSION__;
@@ -45,6 +46,10 @@ function start() {
     relay: relayBase(relayOverride),
     relayParam: relayOverride && isLoopback(relayOverride) ? `&coopRelay=${encodeURIComponent(relayOverride)}` : "",
     uncapped: params.get("coopUncapped") !== "0",
+    // Controller support needs the patched engine (its command mailbox), so with it on the engine is patched in
+    // solo games too. Off: solo games run exactly as on vel.gg.
+    controller: readSetting("bo1z-coop-controller", "1") !== "0",
+    aimLevel: Math.max(0, Math.min(AIM_SPEEDS.length - 1, Number(readSetting("bo1z-coop-aim", "4")) || 0)),
     socket: "idle",
     peer: false,
     peerInfo: null,
@@ -86,9 +91,27 @@ function start() {
       navigator.clipboard?.writeText(inviteLink(coop)).then(() => { coop.copiedAt = Date.now(); }, () => { coop.notice = inviteLink(coop); });
     },
     leave: () => { coop.pump?.postMessage({ type: "close" }); go(location.pathname); },
+    controller: () => {
+      coop.controller = !coop.controller;
+      saveSetting("bo1z-coop-controller", coop.controller ? "1" : "0");
+      coop.notice = "Reload the page to apply the controller setting.";
+    },
+    aimDown: () => setAim(coop, coop.aimLevel - 1),
+    aimUp: () => setAim(coop, coop.aimLevel + 1),
   });
   coop.panel = panel;
   panel.mount();
+
+  if (coop.controller) {
+    coop.gamepad = new GamepadControl({
+      // Only while our player is in a game: the engine runs the commands and the menus own the cursor.
+      engine: () => (coop.mem && coop.patched && coop.mem.connectionState() === CONNECTION.active
+        ? { Module: coop.mem.Module, command: (text) => coop.mem.command(text) } : null),
+      canvasSize: () => { const canvas = document.getElementById("game"); return { width: canvas?.width || 1280, height: canvas?.height || 720 }; },
+      aimLevel: coop.aimLevel,
+    });
+    coop.gamepad.start();
+  }
 
   if (coop.mode) {
     coop.phase = coop.mode === "host" ? "hosting" : "joining-room";
@@ -109,7 +132,7 @@ function installWasmHook(coop) {
     coop.hash = await sha256Hex(bytes);
     coop.build = BUILDS[coop.hash] ?? null;
     if (!coop.build) {
-      coop.error = "vel.gg updated its game engine, and this version of the co-op extension does not know it yet. The game runs solo.";
+      coop.error = "vel.gg updated its game engine, and this version of the extension does not know it yet: co-op and the controller are off.";
       coop.note(`unknown engine build ${coop.hash}`);
       return bytes;
     }
@@ -119,14 +142,14 @@ function installWasmHook(coop) {
       coop.note("engine patched");
       return patched;
     } catch (error) {
-      coop.error = `Could not prepare the engine for co-op (${error.message}). The game runs solo.`;
+      coop.error = `Could not prepare the engine (${error.message}): co-op and the controller are off.`;
       coop.note(`patch failed: ${error.stack ?? error}`);
       return bytes;
     }
   }
 
   WebAssembly.instantiateStreaming = async function (source, imports) {
-    if (!coop.mode || coop.hash) return nativeStreaming.call(WebAssembly, source, imports);
+    if (!(coop.mode || coop.controller) || coop.hash) return nativeStreaming.call(WebAssembly, source, imports);
     const response = await source;
     if (!isEngine(response.url)) return nativeStreaming.call(WebAssembly, response, imports);
     const bytes = new Uint8Array(await response.arrayBuffer());
@@ -135,7 +158,7 @@ function installWasmHook(coop) {
   WebAssembly.instantiate = function (source, imports) {
     // The glue's fallback path (no streaming) passes the raw bytes.
     const bytes = source instanceof ArrayBuffer ? new Uint8Array(source) : ArrayBuffer.isView(source) ? new Uint8Array(source.buffer, source.byteOffset, source.byteLength) : null;
-    if (coop.mode && !coop.hash && bytes && bytes.byteLength > 5e6) {
+    if ((coop.mode || coop.controller) && !coop.hash && bytes && bytes.byteLength > 5e6) {
       return prepare(bytes.slice()).then((ready) => nativeInstantiate.call(WebAssembly, ready, imports));
     }
     return nativeInstantiate.call(WebAssembly, source, imports);
@@ -157,6 +180,7 @@ function installCallMainHook(coop) {
         enumerable: true,
         writable: true,
         value(args) {
+          if (!coop.mode && coop.patched) coop.mem = new EngineMemory(Module, coop.build); // solo, for the controller
           if (!coop.mode || !coop.patched) return original.call(this, args);
           return (async () => {
             try {
@@ -464,7 +488,8 @@ function view(coop) {
     blocks.push({ kind: "text", cls: "muted", text: "Play zombies with a friend: one hosts, the other joins with the invite link. Both need this extension." });
     blocks.push({ kind: "buttons", buttons: [{ act: "host", label: "Host a game", primary: true }] });
     blocks.push({ kind: "join" });
-    return { tone: "", blocks };
+    blocks.push(...controllerBlocks(coop));
+    return { tone: "", blocks, compact: playing && !coop.error && !coop.notice, pill: coop.gamepad?.status === "active" ? "🎮" : "" };
   }
 
   const relay = coop.socket === "open" ? "connected" : coop.socket === "connecting" ? "connecting…" : coop.socket === "closed" ? "reconnecting…" : "starting…";
@@ -513,12 +538,41 @@ function view(coop) {
     pill = `Co-op · ${coop.phase === "connected" ? "with host" : steps[coop.phase] ?? ""} · ${rtt}`;
   }
   if (coop.stats?.lost) blocks.push({ kind: "text", cls: "muted small", text: `${coop.stats.lost} packets dropped` });
+  blocks.push(...controllerBlocks(coop));
+  if (coop.gamepad?.status === "active") pill += " · 🎮";
   blocks.push({ kind: "buttons", buttons: [{ act: "leave", label: "Leave co-op" }] });
   return { tone, blocks, compact: playing && !coop.error, pill };
 }
 
+function controllerBlocks(coop) {
+  const pad = coop.gamepad;
+  const name = pad?.name ? pad.name.replace(/\s*\(.*$/, "").slice(0, 32) : "";
+  const status = !coop.controller ? "off"
+    : !coop.patched && coop.hash ? "unavailable"
+    : !pad || pad.status === "none" ? "press any button on it"
+    : pad.status === "active" ? `${name} · aim ${coop.aimLevel + 1}/${AIM_SPEEDS.length}`
+    : `${name} · works once you are in the game`;
+  const buttons = coop.controller && pad?.status !== "none"
+    ? [{ act: "aimDown", label: "Aim −" }, { act: "aimUp", label: "Aim +" }, { act: "controller", label: "Turn off" }]
+    : [{ act: "controller", label: coop.controller ? "Turn controller off" : "Turn controller on" }];
+  return [{ kind: "lines", lines: [["Controller", status]] }, { kind: "buttons", buttons }];
+}
+
+function setAim(coop, level) {
+  coop.aimLevel = Math.max(0, Math.min(AIM_SPEEDS.length - 1, level));
+  if (coop.gamepad) coop.gamepad.aimLevel = coop.aimLevel;
+  saveSetting("bo1z-coop-aim", String(coop.aimLevel));
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Helpers
+
+function readSetting(key, fallback) {
+  try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; }
+}
+function saveSetting(key, value) {
+  try { localStorage.setItem(key, value); } catch { /* not kept */ }
+}
 
 function go(url) { location.assign(url); }
 

@@ -34,6 +34,32 @@ It has two parts:
 1. Open the invite link (or paste it, or the room code, into the card's **Join** box on vel.gg/bo1z).
 2. Press any key when the page asks, wait for the map to load and for "In the host's game", then click the game.
 
+### Controller (PS5, PS4, Xbox)
+
+Plug the controller in (USB or Bluetooth) and press any button on it: the Co-op card shows it under
+"Controller". It works in solo games too. Click the game once with the mouse to start (browsers do not let a
+controller start the sound or capture the mouse), then play with the controller.
+
+| Button (PlayStation / Xbox) | Action |
+| --- | --- |
+| Left stick / L3 | move (analog) / sprint |
+| Right stick | aim (speed: the card's **Aim −** / **Aim +**) |
+| R2 / RT | fire |
+| L2 / LT | aim down sights |
+| R1 / RB | grenade |
+| L1 / LB | special grenade (monkey bomb, ...) |
+| Square / X | reload; hold to use, buy, open, revive |
+| Cross / A | jump |
+| Circle / B | crouch; hold to go prone |
+| Triangle / Y | switch weapon |
+| R3 | melee |
+| D-pad | equipment slots 1-4 |
+| Options / Menu | pause menu (in menus: stick moves the cursor, Cross clicks, Circle goes back) |
+| Create / View | scoreboard |
+
+The controller uses the engine's own actions through the extension's patched engine, so when it is on the engine is
+patched in solo games too. **Turn controller off** in the card (then reload) to leave solo games untouched.
+
 The host's game is the real one: zombies, rounds and points all live on the host's computer, and player 2 joins it
 like in the original game. The host should keep their tab open for the whole game; switching tabs is fine.
 
