@@ -9,6 +9,9 @@
 //     if (sock == 1) { q = atomic.load(INQ); if (q && ring1.get >= ring1.send) sock = q; }
 //     // host: once ring 1 is empty, the server also drains ring q, which only the page writes (the remote player)
 // Both are inert while the three mailbox words are 0, which is how the engine starts.
+// P4, in CachedTag_UpdateTagInternal: its two calls to Com_Error (no model on the entity, no such tag) become
+//     three drops of the call's arguments, so the function falls through to its normal exit and leaves the cached
+//     tag as it was. Both are co-op-only situations (another player's body being drawn before its model exists).
 // P3, at the end of Assert_MyHandler: instead of trapping after printing a failed debug check, restore the stack and
 //     return 1 ("continue"), as the retail game does with its checks compiled out. Solo play on vel.gg never runs
 //     some code co-op needs (drawing a second player), and one of its checks would otherwise stop the engine.
@@ -118,6 +121,24 @@ function nonFatalAssert(body, params) {
   return out;
 }
 
+// P4: replace every "call <callee>" in a body with drops of its arguments. The call must take `args` values and
+// return nothing, so the stack is unchanged and the following instructions run as before.
+function neutralizeCalls(body, callee, args, expected) {
+  const pattern = Uint8Array.from([0x10, ...uleb(callee)]);
+  const out = Uint8Array.from(body);
+  let found = 0;
+  for (let i = 0; i + pattern.length <= out.length; i += 1) {
+    if (pattern.every((byte, k) => out[i + k] === byte)) {
+      if (pattern.length !== args) throw new Error("neutralizeCalls: call and drops differ in size");
+      for (let k = 0; k < args; k += 1) out[i + k] = 0x1a; // drop
+      found += 1;
+      i += pattern.length - 1;
+    }
+  }
+  if (found !== expected) throw new Error(`neutralizeCalls: found ${found} calls, expected ${expected}`);
+  return out;
+}
+
 /** Section table, import count and function names of a wasm binary. */
 export function inspectWasm(bytes) {
   if (bytes[0] !== 0 || bytes[1] !== 0x61 || bytes[2] !== 0x73 || bytes[3] !== 0x6d) throw new Error("not a wasm module");
@@ -203,8 +224,9 @@ export function patchEngine(input, hash, build = BUILDS[hash]) {
     [build.functions.netGetLoopPacket[0] - importedFunctions, [netGetLoopPacketPrologue(build), 3, 4]],
   ]);
 
-  // Optional per build (P3).
+  // Optional per build (P3, P4).
   const assertIndex = build.functions.assertHandler ? build.functions.assertHandler[0] - importedFunctions : -1;
+  const cachedTagIndex = build.functions.cachedTagUpdate && build.functions.comError ? build.functions.cachedTagUpdate[0] - importedFunctions : -1;
 
   let [count, at] = readUleb(bytes, code.body);
   const parts = [Uint8Array.from(uleb(count))];
@@ -215,6 +237,11 @@ export function patchEngine(input, hash, build = BUILDS[hash]) {
     const target = targets.get(i);
     if (assertIndex === i) {
       const body = nonFatalAssert(bytes.subarray(bodyStart, bodyEnd), 4);
+      parts.push(Uint8Array.from(uleb(body.length)), body);
+      patched += 1;
+    } else if (cachedTagIndex === i) {
+      // Com_Error(errorParm_t, const char*, ...) takes three i32s in wasm (code, format, varargs pointer).
+      const body = neutralizeCalls(bytes.subarray(bodyStart, bodyEnd), build.functions.comError[0], 3, 2);
       parts.push(Uint8Array.from(uleb(body.length)), body);
       patched += 1;
     } else if (target) {
@@ -241,7 +268,7 @@ export function patchEngine(input, hash, build = BUILDS[hash]) {
     }
     at = bodyEnd;
   }
-  if (patched !== targets.size + (assertIndex >= 0 ? 1 : 0)) throw new Error("patch targets not found");
+  if (patched !== targets.size + (assertIndex >= 0 ? 1 : 0) + (cachedTagIndex >= 0 ? 1 : 0)) throw new Error("patch targets not found");
 
   const bodyLength = parts.reduce((sum, part) => sum + part.length, 0);
   const header = Uint8Array.from([10, ...uleb(bodyLength)]);
