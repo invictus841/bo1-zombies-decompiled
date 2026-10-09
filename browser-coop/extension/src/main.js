@@ -355,6 +355,13 @@ function hostTick(coop) {
   if (!coop.peer) coop.lastStateKey = null;
   // Wait for player 2 before starting, unless the host chose to start alone.
   coop.gate = screen === "ready" && !coop.startAlone && !(slot && slot.state === CLIENT_STATE.active);
+  // A paused server ignores join requests, and alone the host's server pauses on the start screen (intro hold) and
+  // in the pause menu. While player 2 is in the room but not in the game yet, keep it running. (With two players
+  // in the game the server never pauses anyway.)
+  if (mem && coop.peer && !(slot && slot.state === CLIENT_STATE.active)) {
+    if (mem.dvarInt("clPaused")) mem.setDvarInt("clPaused", 0);
+    if (mem.dvarInt("svPaused")) mem.setDvarInt("svPaused", 0);
+  }
   // The guest closed its page: free its slot once it is clearly gone (a reload comes back within seconds).
   if (slot && !coop.peer && coop.peerLeftAt && Date.now() - coop.peerLeftAt > KICK_AFTER_MS && coop.kickedAt !== coop.peerLeftAt) {
     if (mem.command(`clientkick ${slot.slot}`)) {

@@ -12,6 +12,8 @@ export const BUILDS = {
       netGetLoopPacket: [4026, "NET_GetLoopPacket(netsrc_t, netadr_t*, msg_t*)"],
       cbufAddText: [291, "Cbuf_AddText(int, char const*)"],
       svWaitServer: [1391, "SV_WaitServer()"],
+      // Debug-check handler: prints "KISAK_HEADLESS assert ..." then traps. In co-op it returns 1 (continue) instead.
+      assertHandler: [170, "Assert_MyHandler(char const*, int, int, char const*, ...)"],
     },
     // Three words of zero padding between web-layer statics, referenced by no instruction.
     // The patch uses them as cross-thread mailboxes: CMD (char* console command), FREEZE (bool), INQ (ring index).

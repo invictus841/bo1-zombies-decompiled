@@ -9,6 +9,9 @@
 //     if (sock == 1) { q = atomic.load(INQ); if (q && ring1.get >= ring1.send) sock = q; }
 //     // host: once ring 1 is empty, the server also drains ring q, which only the page writes (the remote player)
 // Both are inert while the three mailbox words are 0, which is how the engine starts.
+// P3, at the end of Assert_MyHandler: instead of trapping after printing a failed debug check, restore the stack and
+//     return 1 ("continue"), as the retail game does with its checks compiled out. Solo play on vel.gg never runs
+//     some code co-op needs (drawing a second player), and one of its checks would otherwise stop the engine.
 
 import { BUILDS } from "./layout.js";
 
@@ -79,6 +82,40 @@ function netGetLoopPacketPrologue(build) {
     ...I32_CONST(0), ...LOCAL_SET(4),
     END,
   ];
+}
+
+function readSleb(bytes, at) {
+  let result = 0, shift = 0, byte;
+  do {
+    byte = bytes[at++];
+    result |= (byte & 0x7f) << shift;
+    shift += 7;
+  } while (byte & 0x80);
+  if (shift < 32 && byte & 0x40) result |= -1 << shift;
+  return [result, at];
+}
+
+// P3: the handler opens a stack frame (global.get sp; i32.const N; i32.sub; local.tee F; global.set sp) and ends
+// with "global.set sp; unreachable; end", leaving that frame open. Replace the unreachable with
+// "local.get F; i32.const N; i32.add; global.set sp; i32.const 1; return".
+function nonFatalAssert(body, params) {
+  let [groups, p] = readUleb(body, 0);
+  for (let g = 0; g < groups; g += 1) p = readUleb(body, p)[1] + 1;
+  const fail = (why) => { throw new Error(`assert handler: ${why}`); };
+  if (body[p] !== 0x23) fail("no stack frame");
+  const [sp, a] = readUleb(body, p + 1);
+  if (body[a] !== 0x41) fail("no frame size");
+  const [frame, b] = readSleb(body, a + 1);
+  if (body[b] !== 0x6b || body[b + 1] !== 0x22) fail("unexpected prologue");
+  const [frameLocal, c] = readUleb(body, b + 2);
+  if (frameLocal < params || body[c] !== 0x24 || readUleb(body, c + 1)[0] !== sp) fail("unexpected prologue");
+  const end = body.length;
+  if (body[end - 1] !== 0x0b || body[end - 2] !== 0x00) fail("does not end with unreachable");
+  const tail = [...LOCAL_GET(frameLocal), ...I32_CONST(frame), 0x6a, 0x24, ...uleb(sp), ...I32_CONST(1), RETURN, END];
+  const out = new Uint8Array(end - 2 + tail.length);
+  out.set(body.subarray(0, end - 2), 0);
+  out.set(tail, end - 2);
+  return out;
 }
 
 /** Section table, import count and function names of a wasm binary. */
@@ -166,6 +203,9 @@ export function patchEngine(input, hash, build = BUILDS[hash]) {
     [build.functions.netGetLoopPacket[0] - importedFunctions, [netGetLoopPacketPrologue(build), 3, 4]],
   ]);
 
+  // Optional per build (P3).
+  const assertIndex = build.functions.assertHandler ? build.functions.assertHandler[0] - importedFunctions : -1;
+
   let [count, at] = readUleb(bytes, code.body);
   const parts = [Uint8Array.from(uleb(count))];
   let patched = 0;
@@ -173,7 +213,11 @@ export function patchEngine(input, hash, build = BUILDS[hash]) {
     const [size, bodyStart] = readUleb(bytes, at);
     const bodyEnd = bodyStart + size;
     const target = targets.get(i);
-    if (target) {
+    if (assertIndex === i) {
+      const body = nonFatalAssert(bytes.subarray(bodyStart, bodyEnd), 4);
+      parts.push(Uint8Array.from(uleb(body.length)), body);
+      patched += 1;
+    } else if (target) {
       const [prologue, params, scratch] = target;
       // Skip the local declarations; the prologue goes before the first instruction.
       let [groups, p] = readUleb(bytes, bodyStart);
@@ -197,7 +241,7 @@ export function patchEngine(input, hash, build = BUILDS[hash]) {
     }
     at = bodyEnd;
   }
-  if (patched !== targets.size) throw new Error("patch targets not found");
+  if (patched !== targets.size + (assertIndex >= 0 ? 1 : 0)) throw new Error("patch targets not found");
 
   const bodyLength = parts.reduce((sum, part) => sum + part.length, 0);
   const header = Uint8Array.from([10, ...uleb(bodyLength)]);
