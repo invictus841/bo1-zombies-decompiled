@@ -61,7 +61,6 @@ function start() {
     zone: null,
     gameArgs: null,
     guestSlot: null,
-    startAlone: false,
     copiedAt: 0,
     refreshRate: 60,
     log: [],
@@ -86,7 +85,6 @@ function start() {
     copy: () => {
       navigator.clipboard?.writeText(inviteLink(coop)).then(() => { coop.copiedAt = Date.now(); }, () => { coop.notice = inviteLink(coop); });
     },
-    startAlone: () => { coop.startAlone = true; },
     leave: () => { coop.pump?.postMessage({ type: "close" }); go(location.pathname); },
   });
   coop.panel = panel;
@@ -95,7 +93,6 @@ function start() {
   if (coop.mode) {
     coop.phase = coop.mode === "host" ? "hosting" : "joining-room";
     coop.pump = startPump(coop);
-    installStartGate(coop, panel);
   }
   setInterval(() => tick(coop), 50);
 }
@@ -176,19 +173,6 @@ function installCallMainHook(coop) {
       });
     },
   });
-}
-
-// Host and guest both stop the page's "click to start" until the other player is in (the host can start alone).
-function installStartGate(coop, panel) {
-  const block = (event) => {
-    if (!coop.gate) return;
-    if (event.composedPath?.().includes(panel.host)) return;
-    event.stopImmediatePropagation();
-    event.preventDefault();
-  };
-  for (const type of ["keydown", "keyup", "mousedown", "mouseup", "click", "pointerdown", "pointerup"]) {
-    window.addEventListener(type, block, true);
-  }
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -353,11 +337,8 @@ function hostTick(coop) {
     send(coop, state);
   }
   if (!coop.peer) coop.lastStateKey = null;
-  // Wait for player 2 before starting, unless the host chose to start alone.
-  coop.gate = screen === "ready" && !coop.startAlone && !(slot && slot.state === CLIENT_STATE.active);
   // The start screen holds the whole game on its first frame (intro hold), and a held game answers nobody. Once
-  // player 2 has loaded the map and is about to join, release the hold as the host's own click would; the host stays
-  // behind the start gate until player 2 is in.
+  // player 2 has loaded the map and is about to join, release the hold as the host's own click would.
   const guestJoining = ["waiting-host", "freezing", "connect", "challenging", "joining"].includes(coop.peerState?.phase);
   if (mem && coop.peer && guestJoining && screen === "ready" && !coop.introReleased && mem.int(coop.build.browser.introState) === 1) {
     coop.introReleased = true;
@@ -380,7 +361,15 @@ function hostTick(coop) {
   }
 }
 
+// Guest phases in which our client talks to the host. Pausing them would only stop our moves reaching the host
+// (our own server is frozen), so the pause menu and the start hold must not pause the client.
+const GUEST_LINKED = ["challenging", "joining", "connected"];
+
 function guestTick(coop) {
+  if (coop.mem && GUEST_LINKED.includes(coop.phase)) {
+    if (coop.mem.dvarInt("clPaused")) coop.mem.setDvarInt("clPaused", 0);
+    if (coop.mem.dvarInt("svPaused")) coop.mem.setDvarInt("svPaused", 0);
+  }
   if (coop.peer && coop.phase !== coop.sentPhase) {
     coop.sentPhase = coop.phase;
     send(coop, { t: "state", phase: coop.phase, v: VERSION });
@@ -392,11 +381,9 @@ function guestTick(coop) {
   const hostReady = coop.peer && coop.peerState?.ready;
   switch (coop.phase) {
     case "loading":
-      coop.gate = screen === "ready";
       if (screen === "ready" || screen === "playing") coop.phase = "waiting-host";
       break;
     case "waiting-host":
-      coop.gate = screen === "ready";
       if (hostReady) {
         // Freeze our own server: from now on nothing in our engine reads ring 1, so the page can forward it.
         mem.setFreeze(true);
@@ -415,6 +402,12 @@ function guestTick(coop) {
       }
       break;
     case "connect":
+      // Our client must not sit on the start screen's hold: a held client sends no moves, and the host's server
+      // times a player out while it waits for the first one. Release it as the page's own click would.
+      if (!coop.introReleased && mem.int(coop.build.browser.introState) === 1) {
+        coop.introReleased = true;
+        mem.Module._KB_Input?.(7, 1, 0);
+      }
       // "LOCALHOST", not "localhost": the exact lowercase name would also shut our local server down.
       if (mem.command("connect LOCALHOST")) {
         coop.connectAt = Date.now();
@@ -442,10 +435,8 @@ function guestTick(coop) {
         coop.error = "The host did not let us in. Reload both pages and try again.";
         coop.phase = "failed";
       }
-      coop.gate = screen === "ready";
       break;
     case "connected":
-      coop.gate = false;
       if (conn < CONNECTION.challenging) {
         coop.phase = "ended";
         coop.note("disconnected");
@@ -456,7 +447,6 @@ function guestTick(coop) {
       }
       break;
     default:
-      coop.gate = false;
   }
 }
 
@@ -484,17 +474,17 @@ function view(coop) {
 
   if (coop.mode === "host") {
     const slot = coop.guestSlot;
-    const p2 = !coop.peer ? (slot ? "reconnecting…" : "not here yet") : !slot ? "loading the map…" : slot.state === CLIENT_STATE.active ? "in the game" : "joining…";
+    const guestJoining = ["freezing", "connect", "challenging", "joining"].includes(coop.peerState?.phase);
+    const p2 = !coop.peer ? (slot ? "reconnecting…" : "not here yet") : !slot ? (guestJoining ? "joining…" : "loading the map…") : slot.state === CLIENT_STATE.active ? "in the game" : "joining…";
     if (slot?.state === CLIENT_STATE.active && coop.peer) tone = "ok";
     blocks.push({ kind: "text", text: "You are hosting. Send this invite link to player 2:" });
     blocks.push({ kind: "code", text: coop.room });
     blocks.push({ kind: "buttons", buttons: [{ act: "copy", label: Date.now() - coop.copiedAt < 2000 ? "Copied!" : "Copy invite link", primary: true }] });
     blocks.push({ kind: "lines", lines: [["Relay", relay], ["Player 2", p2], ["Ping", rtt]] });
-    if (coop.gate) {
-      blocks.push({ kind: "text", cls: "muted small", text: "The game starts once player 2 is in. Pick a map first; your friend follows you automatically." });
-      blocks.push({ kind: "buttons", buttons: [{ act: "startAlone", label: "Start without player 2" }] });
-    } else if (!coop.mem && screen !== "loading" && screen !== "download") {
+    if (!coop.mem && screen !== "loading" && screen !== "download") {
       blocks.push({ kind: "text", cls: "muted small", text: "Pick a map. Player 2 follows you to it." });
+    } else if (!(slot?.state === CLIENT_STATE.active)) {
+      blocks.push({ kind: "text", cls: "muted small", text: "Player 2 can join any time, before or after you click in." });
     }
     pill = `Co-op · P2 ${slot?.state === CLIENT_STATE.active && coop.peer ? "in" : "not in"} · ${rtt}`;
   } else {
