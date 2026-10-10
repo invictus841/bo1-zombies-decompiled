@@ -17,6 +17,9 @@ button.act { all: unset; box-sizing: border-box; text-align: center; cursor: poi
 button.act:hover, button.act:focus-visible { background: #2c2c2c; border-color: #888; }
 button.act.primary { background: #c9c9c9; color: #000; border-color: #c9c9c9; } button.act.primary:hover { background: #fff; }
 button.act[disabled] { opacity: .5; cursor: default; }
+.meter { height: 6px; border-radius: 3px; background: #333; overflow: hidden; }
+.meter > span { display: block; height: 100%; background: #5fbf5f; }
+.meter.warn > span { background: #e0b84a; } .meter.full > span { background: #e05a4a; }
 .row { display: flex; gap: 6px; } .row > * { flex: 1; }
 input { all: unset; box-sizing: border-box; padding: 6px 8px; border: 1px solid #555; border-radius: 4px; background: #111; color: #fff; font: 13px ui-monospace, Menlo, monospace; min-width: 0; }
 input:focus { border-color: #999; }
@@ -101,6 +104,17 @@ export class Panel {
           row.append(button);
         }
         return row;
+      }
+      case "meter": {
+        // { fraction (0..1), label }: a thin bar with a caption above it.
+        const box = el("div", "lines");
+        box.append(el("div", "small muted", block.label));
+        const bar = el("div", `meter ${block.fraction >= 1 ? "full" : block.fraction >= 0.75 ? "warn" : ""}`);
+        const fill = el("span");
+        fill.style.width = `${Math.round(Math.min(1, Math.max(0, block.fraction)) * 100)}%`;
+        bar.append(fill);
+        box.append(bar);
+        return box;
       }
       case "input": {
         // { field, placeholder, act, label, value }: a text box and its button.

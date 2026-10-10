@@ -129,6 +129,12 @@ function start() {
     coop.gamepad.start();
   }
 
+  // Today's estimated use of the relay's free daily allowance (GET /usage): at start, then every 10 minutes.
+  const readUsage = () => fetch(`${coop.relay}/usage`).then((r) => (r.ok ? r.json() : null))
+    .then((usage) => { coop.usage = usage && Number.isFinite(usage.fraction) ? usage : null; }, () => { coop.usage = null; });
+  readUsage();
+  setInterval(readUsage, 600000);
+
   if (coop.mode) {
     coop.phase = coop.mode === "host" ? "hosting" : "joining-room";
     coop.pump = startPump(coop);
@@ -728,6 +734,8 @@ function view(coop) {
     pill = coop.phase === "connected" && coop.pausedApplied ? `Co-op · ${coop.menuOpen ? "paused" : "paused by host"}` : `Co-op · ${coop.phase === "connected" ? "with host" : steps[coop.phase] ?? ""} · ${rtt}`;
   }
   if (coop.stats?.lost) blocks.push({ kind: "text", cls: "muted small", text: `${coop.stats.lost} packets dropped` });
+  const usage = usageBlock(coop);
+  if (usage) blocks.push(usage);
   blocks.push(...controllerBlocks(coop));
   if (coop.gamepad?.status === "active") pill += " · 🎮";
   blocks.push({ kind: "buttons", buttons: [{ act: "leave", label: "Leave co-op" }] });
@@ -754,7 +762,10 @@ const CREDITS = { kind: "text", cls: "muted small", text: "Thanks to MisaDev4 (v
 // Cloudflare plan (a few hours of play a day in total); anyone can run their own (see the README).
 function relayBlocks(coop) {
   const own = coop.relay !== DEFAULT_RELAY;
-  const blocks = [{ kind: "lines", lines: [["Relay", own ? new URL(coop.relay).hostname : "shared (free, ~6 h of play a day for everyone)"]] }];
+  const blocks = [{ kind: "lines", lines: [["Relay", own ? `your own (${new URL(coop.relay).hostname})` : "shared"]] }];
+  if (!own) blocks.push({ kind: "text", cls: "muted small", text: "Free, about 6 hours of play per day in total, shared by everyone who uses this extension (not 6 hours each). When it is used up, co-op stops until the daily reset." });
+  const usage = usageBlock(coop);
+  if (usage) blocks.push(usage);
   if (coop.editRelay) {
     blocks.push({ kind: "input", field: "relay", placeholder: "https://your-relay.workers.dev", act: "saveRelay", label: "Save", value: own ? coop.relay : "" });
     blocks.push({ kind: "text", cls: "muted small", text: "Both players must use the same relay. Your invite links carry it, so your friend can switch with one click." });
@@ -763,6 +774,17 @@ function relayBlocks(coop) {
     blocks.push({ kind: "buttons", buttons: [{ act: "editRelay", label: "Change relay" }] });
   }
   return blocks;
+}
+
+function usageBlock(coop) {
+  const usage = coop.usage;
+  if (!usage) return null;
+  const resets = new Date(usage.resetsAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const hoursLeft = Math.max(0, (1 - usage.fraction) * 6);
+  const label = usage.fraction >= 1
+    ? `Used up for today (estimate). Resets at ${resets}.`
+    : `Today: ${Math.round(usage.fraction * 100)}% used, about ${hoursLeft < 1 ? "less than 1" : hoursLeft.toFixed(0)} h of play left for everyone (estimate). Resets at ${resets}.`;
+  return { kind: "meter", fraction: usage.fraction, label };
 }
 
 function setAim(coop, level) {

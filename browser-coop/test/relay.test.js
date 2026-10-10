@@ -117,3 +117,30 @@ test("upgrades are checked: role, protocol version, room id, origin", async () =
   assert.equal(await status("/v1/rooms/abc?role=host&v=2", { Origin: "https://evil.example" }), 403);
   assert.equal((await worker.fetch(`${http}/v1/rooms/abc?role=host&v=2`)).status, 426);
 });
+
+test("usage counts connections and messages for the day, reported when players leave", async () => {
+  const http = base.replace(/^ws/, "http");
+  const before = await (await fetch(`${http}/usage`)).json();
+  assert.equal(before.limit, 100000);
+  assert.equal(before.estimate, true);
+  const room = newRoom();
+  const host = connect(room, "host");
+  await host.next();
+  const guest = connect(room, "guest");
+  await guest.next();
+  await host.next();
+  for (let i = 0; i < 40; i += 1) guest.socket.send(encodePackets([Uint8Array.of(i)]));
+  for (let i = 0; i < 40; i += 1) await host.next();
+  guest.socket.close();
+  await guest.closed;
+  host.socket.close();
+  await host.closed;
+  let after = before;
+  for (let i = 0; i < 20 && after.requests <= before.requests; i += 1) {
+    await new Promise((r) => setTimeout(r, 100));
+    after = await (await worker.fetch(`${http}/usage?t=${i}`)).json();
+  }
+  // 2 connections + 40 messages / 20 + at least one report.
+  assert.ok(after.requests - before.requests >= 5, `requests went from ${before.requests} to ${after.requests}`);
+  assert.ok(after.fraction > 0 && after.fraction < 1);
+});
