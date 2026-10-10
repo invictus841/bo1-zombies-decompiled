@@ -17,6 +17,7 @@ button.act { all: unset; box-sizing: border-box; text-align: center; cursor: poi
 button.act:hover, button.act:focus-visible { background: #2c2c2c; border-color: #888; }
 button.act.primary { background: #c9c9c9; color: #000; border-color: #c9c9c9; } button.act.primary:hover { background: #fff; }
 button.act[disabled] { opacity: .5; cursor: default; }
+a.link { color: #9cc7ff; text-decoration: underline; cursor: pointer; }
 .meter { height: 6px; border-radius: 3px; background: #333; overflow: hidden; }
 .meter > span { display: block; height: 100%; background: #5fbf5f; }
 .meter.warn > span { background: #e0b84a; } .meter.full > span { background: #e05a4a; }
@@ -104,6 +105,17 @@ export class Panel {
           row.append(button);
         }
         return row;
+      }
+      case "link": {
+        // { title, text, href }: a short note with a link, opened in a new tab.
+        const box = el("div", "small");
+        if (block.title) box.append(el("b", "", `${block.title} `));
+        const a = el("a", "link", block.text);
+        a.href = block.href;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        box.append(a);
+        return box;
       }
       case "meter": {
         // { fraction (0..1), label }: a thin bar with a caption above it.

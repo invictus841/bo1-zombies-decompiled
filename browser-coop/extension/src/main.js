@@ -764,6 +764,8 @@ function relayBlocks(coop) {
   const own = coop.relay !== DEFAULT_RELAY;
   const blocks = [{ kind: "lines", lines: [["Relay", own ? `your own (${new URL(coop.relay).hostname})` : "shared"]] }];
   if (!own) blocks.push({ kind: "text", cls: "muted small", text: "Free, about 6 hours of play per day in total, shared by everyone who uses this extension (not 6 hours each). When it is used up, co-op stops until the daily reset." });
+  if (!own) blocks.push({ kind: "link", title: "Wanna host your own relay and play as much as you want? Easy 5-minute setup:",
+    text: "how to set it up", href: "https://github.com/invictus841/bo1z-coop-extension#the-relay-shared-by-default-or-your-own" });
   const usage = usageBlock(coop);
   if (usage) blocks.push(usage);
   if (coop.editRelay) {
