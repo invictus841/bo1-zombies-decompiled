@@ -3,9 +3,9 @@
 Two-player co-op for the browser BO1 Zombies at [vel.gg/bo1z](https://vel.gg/bo1z/): one player hosts, the other
 joins with an invite link. It works on the same Wi-Fi or across the internet.
 
-> **Status:** the relay is deployed and tested, and the host side works in the real game (the patched engine loads,
-> waits for player 2 and connects to the relay). Player 2 joining has not been tested end to end yet: if it fails, the
-> Co-op card shows the error, and `__bo1zCoop.log` in the browser console (F12) has the details.
+> **Status:** tested with two players on two computers over the internet, with mouse and keyboard and with a
+> controller. If something fails, the Co-op card shows the error, and `__bo1zCoop.log` in the browser console (F12)
+> has the details.
 
 It has two parts:
 
@@ -99,7 +99,7 @@ Host browser                                        Guest browser
   map normally, then the extension freezes the guest's own server (a patch to `SV_Frame`) and runs
   `connect LOCALHOST`. The guest's client now sends to ring 1, which the extension forwards to the host, and reads
   ring 0, where the extension writes the host's replies.
-- **The patch.** When co-op is on, the extension adds two short prologues to the engine as the page loads it (about
+- **The patch.** When co-op is on, the extension makes a few short changes to the engine as the page loads it (about
   100 bytes, done in the browser in a few milliseconds). They do nothing until the extension sets one of three
   "mailbox" words: a console command to run, "freeze the local server", and "also read ring Q".
 - **The relay.** A Cloudflare Durable Object per room, holding one host and one guest WebSocket. It forwards binary
