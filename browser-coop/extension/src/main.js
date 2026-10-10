@@ -45,6 +45,10 @@ function start() {
     room,
     relay: relayBase(relayOverride),
     relayParam: relayOverride && isLoopback(relayOverride) ? `&coopRelay=${encodeURIComponent(relayOverride)}` : "",
+    // A host on its own relay puts it in the invite link; the guest switches to it with one click (a relay chosen
+    // by someone else is never used silently).
+    inviteRelay: normalizeRelay(params.get("relay") ?? ""),
+    editRelay: false,
     uncapped: params.get("coopUncapped") !== "0",
     // Controller support needs the patched engine (its command mailbox), so with it on the engine is patched in
     // solo games too. Off: solo games run exactly as on vel.gg.
@@ -93,6 +97,15 @@ function start() {
     leave: () => { coop.pump?.postMessage({ type: "close" }); go(location.pathname); },
     startNow: () => { coop.startAlone = true; },
     rejoin: () => location.reload(),
+    editRelay: () => { coop.editRelay = !coop.editRelay; },
+    saveRelay: (text) => {
+      const url = normalizeRelay(text ?? "");
+      if (!url) { coop.notice = "That is not a relay address. It looks like https://something.workers.dev"; return; }
+      saveSetting("bo1z-coop-relay", url === DEFAULT_RELAY ? "" : url);
+      location.reload();
+    },
+    defaultRelay: () => { saveSetting("bo1z-coop-relay", ""); location.reload(); },
+    useInviteRelay: () => { saveSetting("bo1z-coop-relay", coop.inviteRelay); location.reload(); },
     goToHost: () => { teleportToHost(coop, "button"); },
     controller: () => {
       coop.controller = !coop.controller;
@@ -647,8 +660,10 @@ function view(coop) {
   if (!coop.mode) {
     blocks.push({ kind: "text", cls: "muted", text: "Play zombies with a friend: one hosts, the other joins with the invite link. Both need this extension." });
     blocks.push({ kind: "buttons", buttons: [{ act: "host", label: "Host a game", primary: true }] });
-    blocks.push({ kind: "join" });
+    blocks.push({ kind: "input", field: "join", placeholder: "Room code or invite link", act: "join", label: "Join" });
     blocks.push(...controllerBlocks(coop));
+    blocks.push(...relayBlocks(coop));
+    blocks.push(CREDITS);
     return { tone: "", blocks, compact: playing && !coop.error && !coop.notice, pill: coop.gamepad?.status === "active" ? "🎮" : "" };
   }
 
@@ -678,6 +693,10 @@ function view(coop) {
     if (coop.pausedApplied) blocks.push({ kind: "text", text: coop.menuOpen ? "Paused. Player 2 is paused too." : "Paused by player 2." });
     pill = coop.pausedApplied ? `Co-op · ${coop.menuOpen ? "paused" : "paused by P2"}` : `Co-op · P2 ${slot?.state === CLIENT_STATE.active && coop.peer ? "in" : "not in"} · ${rtt}`;
   } else {
+    if (coop.inviteRelay && coop.inviteRelay !== coop.relay) {
+      blocks.push({ kind: "text", text: `This invite uses another relay: ${new URL(coop.inviteRelay).hostname}. Switch to it to join.` });
+      blocks.push({ kind: "buttons", buttons: [{ act: "useInviteRelay", label: "Use this relay", primary: true }] });
+    }
     const host = coop.peerInfo?.slug ? MAP_NAMES[coop.peerInfo.slug] : null;
     const steps = {
       "joining-room": coop.peer ? (host ? `Opening ${host}…` : "Waiting for the host to pick a map…") : "Waiting for the host…",
@@ -729,6 +748,23 @@ function controllerBlocks(coop) {
   return [{ kind: "lines", lines: [["Controller", status]] }, { kind: "buttons", buttons }];
 }
 
+const CREDITS = { kind: "text", cls: "muted small", text: "Thanks to MisaDev4 (vel.gg, the browser BO1 Zombies) · Co-op extension by invictus841" };
+
+// Which relay carries the games. The default one is shared by everyone who uses this extension, on its owner's free
+// Cloudflare plan (a few hours of play a day in total); anyone can run their own (see the README).
+function relayBlocks(coop) {
+  const own = coop.relay !== DEFAULT_RELAY;
+  const blocks = [{ kind: "lines", lines: [["Relay", own ? new URL(coop.relay).hostname : "shared (free, ~6 h of play a day for everyone)"]] }];
+  if (coop.editRelay) {
+    blocks.push({ kind: "input", field: "relay", placeholder: "https://your-relay.workers.dev", act: "saveRelay", label: "Save", value: own ? coop.relay : "" });
+    blocks.push({ kind: "text", cls: "muted small", text: "Both players must use the same relay. Your invite links carry it, so your friend can switch with one click." });
+    blocks.push({ kind: "buttons", buttons: [{ act: "defaultRelay", label: "Use the shared relay" }, { act: "editRelay", label: "Cancel" }] });
+  } else {
+    blocks.push({ kind: "buttons", buttons: [{ act: "editRelay", label: "Change relay" }] });
+  }
+  return blocks;
+}
+
 function setAim(coop, level) {
   coop.aimLevel = Math.max(0, Math.min(AIM_SPEEDS.length - 1, level));
   if (coop.gamepad) coop.gamepad.aimLevel = coop.aimLevel;
@@ -747,7 +783,19 @@ function saveSetting(key, value) {
 
 function go(url) { location.assign(url); }
 
-function inviteLink(coop) { return `${location.origin}${BASE}?coop=join&room=${coop.room}${coop.relayParam}`; }
+function inviteLink(coop) {
+  const relay = coop.relay !== DEFAULT_RELAY && !coop.relayParam ? `&relay=${encodeURIComponent(coop.relay)}` : "";
+  return `${location.origin}${BASE}?coop=join&room=${coop.room}${coop.relayParam}${relay}`;
+}
+
+/** An https relay address reduced to its origin, or "" when it is not one. */
+function normalizeRelay(text) {
+  try {
+    const url = new URL(text.trim());
+    if (url.protocol === "wss:") url.protocol = "https:";
+    return url.protocol === "https:" && url.hostname.includes(".") ? url.origin : "";
+  } catch { return ""; }
+}
 
 function isLoopback(url) {
   try { return ["127.0.0.1", "localhost", "[::1]"].includes(new URL(url).hostname); } catch { return false; }
@@ -757,7 +805,8 @@ function relayBase(override) {
   if (override && isLoopback(override)) return override;
   try {
     const saved = localStorage.getItem("bo1z-coop-relay");
-    if (saved && /^(https|wss):\/\//.test(saved)) return saved;
+    const url = saved ? normalizeRelay(saved) : "";
+    if (url) return url;
   } catch { /* storage disabled */ }
   return DEFAULT_RELAY;
 }

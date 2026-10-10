@@ -47,11 +47,13 @@ export class Panel {
       if (!button || button.disabled) return;
       const act = button.dataset.act;
       if (act === "collapse") { this.host.classList.toggle("collapsed"); return; }
-      if (act === "join") { this.handlers.join?.(this.root.querySelector("input")?.value ?? ""); return; }
-      this.handlers[act]?.();
+      // A button next to an input sends that input's text.
+      const field = button.dataset.field ? this.root.querySelector(`input[data-field="${button.dataset.field}"]`) : null;
+      this.handlers[act]?.(field ? field.value : undefined);
     });
     this.root.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" && event.target.matches?.("input")) this.handlers.join?.(event.target.value);
+      const input = event.target.matches?.("input[data-act]") ? event.target : null;
+      if (event.key === "Enter" && input) this.handlers[input.dataset.act]?.(input.value);
     });
   }
 
@@ -65,14 +67,15 @@ export class Panel {
   render(view) {
     const key = JSON.stringify(view);
     if (key === this.view) return;
-    const previousInput = this.root.querySelector("input")?.value;
+    const previous = new Map([...this.root.querySelectorAll("input[data-field]")].map((i) => [i.dataset.field, i.value]));
     this.view = key;
     this.dot.className = `dot ${view.tone ?? ""}`;
     this.host.classList.toggle("compact", Boolean(view.compact));
     this.pill.textContent = view.pill ?? "";
     this.body.replaceChildren(...view.blocks.map((block) => this.block(block)));
-    const input = this.root.querySelector("input");
-    if (input && previousInput) input.value = previousInput;
+    for (const input of this.root.querySelectorAll("input[data-field]")) {
+      if (previous.get(input.dataset.field)) input.value = previous.get(input.dataset.field);
+    }
   }
 
   block(block) {
@@ -99,13 +102,18 @@ export class Panel {
         }
         return row;
       }
-      case "join": {
+      case "input": {
+        // { field, placeholder, act, label, value }: a text box and its button.
         const row = el("div", "row");
         const input = el("input");
-        input.placeholder = "Room code or invite link";
+        input.placeholder = block.placeholder ?? "";
         input.spellcheck = false;
-        const button = el("button", "act", "Join");
-        button.dataset.act = "join";
+        input.dataset.field = block.field;
+        input.dataset.act = block.act;
+        if (block.value) input.value = block.value;
+        const button = el("button", "act", block.label);
+        button.dataset.act = block.act;
+        button.dataset.field = block.field;
         button.style.flex = "0 0 auto";
         row.append(input, button);
         return row;
