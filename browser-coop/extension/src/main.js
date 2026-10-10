@@ -410,7 +410,9 @@ function hostTick(coop) {
     coop.menuOpen = menuOpen;
     if (coop.peer) send(coop, { t: "pause", on: menuOpen });
   }
-  if (mem) pauseHost(coop, guestActive && (menuOpen || (coop.peer && coop.remotePause)), menuOpen);
+  // Shared pause only while player 2 is really in the game on both sides; otherwise never hold the server frozen.
+  const guestLinked = coop.peer && coop.peerState?.phase === "connected";
+  if (mem) pauseHost(coop, guestActive && guestLinked && (menuOpen || coop.remotePause), menuOpen);
   // Player 2's extension keeps player 2 next to the host (teleportToHost): send where the host is, once a second.
   const view = latestView();
   if (coop.peer && guestActive && view && view.ms !== coop.sentViewMs) {
@@ -420,8 +422,9 @@ function hostTick(coop) {
   // Free player 2's slot when it is gone or about to join again (a reload after a crash): the server refuses a
   // second connection from a slot that is still in the game.
   const guestPhase = coop.peerState?.phase;
+  // Any phase before "challenging" means a new player 2 page: the old slot must go before it connects.
   const stale = slot && slot.state >= CLIENT_STATE.connected && (
-    (coop.peer && ["freezing", "connect", "ended", "failed"].includes(guestPhase)) ||
+    (coop.peer && guestPhase && !["challenging", "joining", "connected"].includes(guestPhase)) ||
     (!coop.peer && coop.peerLeftAt && Date.now() - coop.peerLeftAt > KICK_AFTER_MS));
   if (stale && Date.now() - (coop.lastKickAt ?? 0) > 5000 && mem.command(`clientkick ${slot.slot}`)) {
     coop.lastKickAt = Date.now();
